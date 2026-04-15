@@ -11,7 +11,7 @@ import threading
 from javax.swing import SwingUtilities
 from prompt_handler import PromptHandler
 from api_client import APIClient
-from report_generator import ReportGenerator
+from report_generator import ReportGenerator, _safe_log_str
 
 
 class Scanner(object):
@@ -37,7 +37,10 @@ class Scanner(object):
 
     def _log(self, msg):
         if self.stdout:
-            self.stdout.write("[Scanner] {0}\n".format(msg))
+            try:
+                self.stdout.write("[Scanner] {0}\n".format(_safe_log_str(msg)))
+            except Exception:
+                pass
 
     def _request_hash(self, request_bytes):
         """MD5 fingerprint of request bytes for deduplication."""

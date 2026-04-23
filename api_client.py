@@ -59,6 +59,44 @@ def _http_post(url_str, headers, body_str, timeout_ms=120000):
         raise RuntimeError("HTTP request failed: {0}".format(str(e)))
 
 
+def _http_get(url_str, headers, timeout_ms=10000):
+    """
+    Perform an HTTPS GET using Java's HttpURLConnection.
+    Returns (status_code, response_body_str).
+    """
+    try:
+        url = URL(url_str)
+        conn = url.openConnection()
+        conn.setRequestMethod("GET")
+        conn.setDoInput(True)
+        conn.setConnectTimeout(10000)
+        conn.setReadTimeout(timeout_ms)
+
+        for key, val in headers.items():
+            conn.setRequestProperty(key, str(val))
+
+        status = conn.getResponseCode()
+
+        if status >= 400:
+            stream = conn.getErrorStream()
+            if stream is None:
+                return status, ""
+        else:
+            stream = conn.getInputStream()
+
+        reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+        lines = []
+        line = reader.readLine()
+        while line is not None:
+            lines.append(line)
+            line = reader.readLine()
+        reader.close()
+        return status, "\n".join(lines)
+
+    except Exception as e:
+        raise RuntimeError("HTTP GET failed: {0}".format(str(e)))
+
+
 def _http_post_with_retry(url_str, headers, body_str, timeout_ms=120000,
                            max_retries=3):
     """
@@ -302,6 +340,123 @@ class APIClient(object):
             return "\n".join(texts) or "[Gemini] Empty response."
         except Exception as e:
             return "[Gemini Exception] {0}".format(str(e))
+
+    # ── Connection tests (lightweight — max_tokens=1) ─────────────────────────
+
+    def test_anthropic(self, api_key, model):
+        if not api_key:
+            return False, "No API key"
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        payload = {"model": model, "max_tokens": 1,
+                   "messages": [{"role": "user", "content": "Hi"}]}
+        try:
+            status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+            if status == 200:
+                return True, "Connected"
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body[:120])
+            except Exception:
+                msg = body[:120]
+            return False, str(msg)[:120]
+        except Exception as e:
+            return False, str(e)[:120]
+
+    def test_openai(self, api_key, model):
+        if not api_key:
+            return False, "No API key"
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": "Bearer {0}".format(api_key)}
+        payload = {"model": model, "max_tokens": 1,
+                   "messages": [{"role": "user", "content": "Hi"}]}
+        try:
+            status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+            if status == 200:
+                return True, "Connected"
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body[:120])
+            except Exception:
+                msg = body[:120]
+            return False, str(msg)[:120]
+        except Exception as e:
+            return False, str(e)[:120]
+
+    def test_openrouter(self, api_key, model):
+        if not api_key:
+            return False, "No API key"
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer {0}".format(api_key),
+            "HTTP-Referer": "https://burp.local",
+            "X-Title": "AgenticBurp",
+        }
+        payload = {"model": model, "max_tokens": 1,
+                   "messages": [{"role": "user", "content": "Hi"}]}
+        try:
+            status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+            if status == 200:
+                return True, "Connected"
+            if status == 401:
+                return False, "Invalid API key (401)"
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body[:100])
+            except Exception:
+                msg = body[:100]
+            return False, "HTTP {0}: {1}".format(status, str(msg)[:80])
+        except Exception as e:
+            return False, str(e)[:120]
+
+    def test_gemini(self, api_key, model):
+        if not api_key:
+            return False, "No API key"
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               "{0}:generateContent?key={1}").format(model, api_key)
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "generationConfig": {"maxOutputTokens": 1},
+        }
+        try:
+            status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+            if status == 200:
+                return True, "Connected"
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body[:120])
+            except Exception:
+                msg = body[:120]
+            return False, str(msg)[:120]
+        except Exception as e:
+            return False, str(e)[:120]
+
+    def test_ollama(self, base_url, model):
+        if not base_url:
+            return False, "No base URL"
+        url = base_url.rstrip("/") + "/api/tags"
+        try:
+            status, body = _http_get(url, {}, timeout_ms=8000)
+            if status != 200:
+                return False, "Server returned HTTP {0}".format(status)
+            try:
+                data = json.loads(body)
+                models = [m.get("name", "") for m in (data.get("models") or [])]
+                model_base = model.split(":")[0]
+                found = any(model_base in m for m in models)
+                if found:
+                    return True, "Connected  (model found)"
+                elif models:
+                    return True, "Connected  (model not pulled yet)"
+                else:
+                    return True, "Connected  (no models pulled)"
+            except Exception:
+                return True, "Connected"
+        except Exception as e:
+            return False, str(e)[:120]
 
     # ── Dispatch ───────────────────────────────────────────────────────────────
 

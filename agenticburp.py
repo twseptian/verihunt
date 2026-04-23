@@ -1,7 +1,38 @@
 # -*- coding: utf-8 -*-
 # AgenticBurp - AI-Powered Security Analysis for Burp Suite
 # Main entry point - load this file in Burp Suite Extensions
-# Set "Folder for loading modules" to this file's directory.
+
+import sys
+import os
+
+# Resolve the extension's own directory in a cross-platform, cross-OS way.
+# Burp's Jython often does NOT set __file__, so we try multiple methods.
+def _resolve_ext_dir():
+    # Method 1: inspect frame (works in most Jython versions inside Burp)
+    try:
+        import inspect
+        frame_file = inspect.getfile(inspect.currentframe())
+        return os.path.dirname(os.path.abspath(frame_file))
+    except Exception:
+        pass
+    # Method 2: __file__ global (standard Python, sometimes available)
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        pass
+    # Method 3: scan sys.path entries for a known sibling module
+    for p in sys.path:
+        try:
+            if os.path.isfile(os.path.join(p, "ui.py")):
+                return p
+        except Exception:
+            pass
+    # Method 4: working directory as last resort
+    return os.getcwd()
+
+_here = _resolve_ext_dir()
+if _here not in sys.path:
+    sys.path.insert(0, _here)
 
 from burp import IBurpExtender, IContextMenuFactory, ITab, IContextMenuInvocation
 from java.util import ArrayList

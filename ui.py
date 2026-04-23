@@ -14,11 +14,13 @@ from javax.swing.text.html import HTMLEditorKit, StyleSheet
 from java.awt import BorderLayout, FlowLayout, GridLayout, Color, Font, Dimension
 from java.awt.event import MouseAdapter, ActionListener as _ActionListener
 from javax.swing.event import DocumentListener as _DocumentListener
+from java.lang import Thread as _JThread, Runnable as _JRunnable
 
 from burp import IMessageEditorController
 
 from prompt_handler import DEFAULT_USER_PROMPT_TEMPLATE, SYSTEM_PROMPT
 from report_generator import _md_to_html as _md2html
+from api_client import APIClient as _APIClient
 
 
 # ── API key obfuscation (XOR + Base64) ────────────────────────────────────────
@@ -68,6 +70,7 @@ class UI(object):
         # Current filter string
         self._filter_str = ""
 
+        self._api_client = _APIClient()
         self._build()
         self._load_settings()
 
@@ -303,6 +306,51 @@ class UI(object):
         btn.addActionListener(_ClearAction())
         return btn
 
+    def _conn_status_lbl(self):
+        """Return a new 'Not tested' status label."""
+        lbl = JLabel(u"● Not tested")
+        lbl.setFont(lbl.getFont().deriveFont(Font.PLAIN, 11.0))
+        lbl.setForeground(Color(0x999999))
+        return lbl
+
+    def _test_conn_btn(self, status_lbl, test_fn):
+        """Return a 'Test' button that runs test_fn() in a background thread."""
+        btn = JButton("Test Connection")
+        btn.setFont(btn.getFont().deriveFont(Font.PLAIN, 11.0))
+        btn.setForeground(Color(0x1565C0))
+        btn.setToolTipText("Test API connectivity with current credentials")
+
+        class _TestAction(_ActionListener):
+            def actionPerformed(self, _e):
+                status_lbl.setText(u"● Testing...")
+                status_lbl.setForeground(Color(0x777777))
+                btn.setEnabled(False)
+
+                class _Worker(_JRunnable):
+                    def run(self):
+                        try:
+                            ok, msg = test_fn()
+                        except Exception as ex:
+                            ok, msg = False, str(ex)[:100]
+
+                        def _update():
+                            btn.setEnabled(True)
+                            if ok:
+                                status_lbl.setText(u"● " + msg)
+                                status_lbl.setForeground(Color(0x2E7D32))
+                            else:
+                                status_lbl.setText(u"● Failed: " + msg[:80])
+                                status_lbl.setForeground(Color(0xC62828))
+
+                        SwingUtilities.invokeLater(_update)
+
+                t = _JThread(_Worker())
+                t.setDaemon(True)
+                t.start()
+
+        btn.addActionListener(_TestAction())
+        return btn
+
     def _build_anthropic(self):
         p = JPanel(BorderLayout(4, 2))
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
@@ -312,8 +360,15 @@ class UI(object):
                                      "claude-haiku-4-5-20251001",
                                      "claude-3-5-sonnet-20241022",
                                      "claude-3-5-haiku-20241022"])
+        self._ant_status = self._conn_status_lbl()
+        _client = self._api_client
+        _key_f  = self._ant_key
+        _mdl_f  = self._ant_model
+        def _ant_test():
+            return _client.test_anthropic(_key_f.getText(), str(_mdl_f.getSelectedItem()))
         rows.add(self._row_panel(JLabel("API Key:"), self._ant_key, self._clear_key_btn(self._ant_key, "anthropic_key")))
         rows.add(self._row_panel(JLabel("Model:  "), self._ant_model))
+        rows.add(self._row_panel(self._test_conn_btn(self._ant_status, _ant_test), self._ant_status))
         rows.add(JLabel("Get key: console.anthropic.com  |  See About tab for model details"))
         p.add(rows, BorderLayout.NORTH)
         return p
@@ -325,8 +380,15 @@ class UI(object):
         self._oai_key   = JPasswordField(40)
         self._oai_model = JComboBox(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
                                      "gpt-4", "gpt-3.5-turbo", "o1", "o1-mini", "o3-mini"])
+        self._oai_status = self._conn_status_lbl()
+        _client = self._api_client
+        _key_f  = self._oai_key
+        _mdl_f  = self._oai_model
+        def _oai_test():
+            return _client.test_openai(_key_f.getText(), str(_mdl_f.getSelectedItem()))
         rows.add(self._row_panel(JLabel("API Key:"), self._oai_key, self._clear_key_btn(self._oai_key, "openai_key")))
         rows.add(self._row_panel(JLabel("Model:  "), self._oai_model))
+        rows.add(self._row_panel(self._test_conn_btn(self._oai_status, _oai_test), self._oai_status))
         rows.add(JLabel("Get key: platform.openai.com  |  See About tab for model details"))
         p.add(rows, BorderLayout.NORTH)
         return p
@@ -337,8 +399,15 @@ class UI(object):
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._or_key   = JPasswordField(40)
         self._or_model = JTextField("meta-llama/llama-3.3-70b-instruct:free", 40)
+        self._or_status = self._conn_status_lbl()
+        _client = self._api_client
+        _key_f  = self._or_key
+        _mdl_f  = self._or_model
+        def _or_test():
+            return _client.test_openrouter(_key_f.getText(), _mdl_f.getText())
         rows.add(self._row_panel(JLabel("API Key:  "), self._or_key, self._clear_key_btn(self._or_key, "or_key")))
         rows.add(self._row_panel(JLabel("Model ID: "), self._or_model))
+        rows.add(self._row_panel(self._test_conn_btn(self._or_status, _or_test), self._or_status))
 
         fast_lbl = JLabel(u"Free: meta-llama/llama-3.3-70b-instruct:free  \u2022  google/gemma-3-27b-it:free  \u2022  deepseek/deepseek-r1:free")
         fast_lbl.setFont(fast_lbl.getFont().deriveFont(Font.PLAIN, 11.0))
@@ -367,8 +436,15 @@ class UI(object):
                                      "gemini-1.5-pro",
                                      "gemini-1.5-flash",
                                      "gemini-1.5-flash-8b"])
+        self._gem_status = self._conn_status_lbl()
+        _client = self._api_client
+        _key_f  = self._gem_key
+        _mdl_f  = self._gem_model
+        def _gem_test():
+            return _client.test_gemini(_key_f.getText(), str(_mdl_f.getSelectedItem()))
         rows.add(self._row_panel(JLabel("API Key:"), self._gem_key, self._clear_key_btn(self._gem_key, "gemini_key")))
         rows.add(self._row_panel(JLabel("Model:  "), self._gem_model))
+        rows.add(self._row_panel(self._test_conn_btn(self._gem_status, _gem_test), self._gem_status))
         rows.add(JLabel("Get key: aistudio.google.com/apikey  |  See About tab for model details"))
         p.add(rows, BorderLayout.NORTH)
         return p
@@ -379,8 +455,15 @@ class UI(object):
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._ollama_url   = JTextField("http://localhost:11434", 40)
         self._ollama_model = JTextField("qwen2.5-coder:7b", 40)
+        self._ollama_status = self._conn_status_lbl()
+        _client = self._api_client
+        _url_f  = self._ollama_url
+        _mdl_f  = self._ollama_model
+        def _ollama_test():
+            return _client.test_ollama(_url_f.getText(), _mdl_f.getText())
         rows.add(self._row_panel(JLabel("Base URL: "), self._ollama_url))
         rows.add(self._row_panel(JLabel("Model:    "), self._ollama_model))
+        rows.add(self._row_panel(self._test_conn_btn(self._ollama_status, _ollama_test), self._ollama_status))
         rows.add(JLabel("Run: ollama serve   Pull: ollama pull qwen2.5-coder:7b"))
         rows.add(JLabel("See About tab for recommended models & token/concurrent settings"))
         p.add(rows, BorderLayout.NORTH)
@@ -858,7 +941,7 @@ class UI(object):
 
     def add_placeholder(self, url, auto_filter=True):
         """Add an in-progress placeholder. Returns a collision-free UUID key."""
-        key = "[...] Analyzing - " + url + " #" + str(_uuid_mod.uuid4())[:8]
+        key = "[...] Analyzing - " + url + "  [" + str(_uuid_mod.uuid4())[:8] + "]"
         self._placeholders.add(key)
         self._list_model.addElement(key)
         # Enable Stop button and reset cancel flag for every new analysis

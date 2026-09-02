@@ -207,73 +207,77 @@ def _md_to_html(text):
 
     text = _convert_tables(text)
 
-    # 8. Lists
+    # 8. Lists — render BOTH "- item" and "1. item" as bullets.
+    #    LLMs frequently number every item "1." (or restart numbering after a code
+    #    block), and Swing's HTMLEditorKit reopens a fresh <ol> after any non-list
+    #    line — so ordered lists rendered as "1. 1. 1. ...". Bullets sidestep all of
+    #    that and read cleanly for advisory/remediation lists.
     lines = text.split("\n")
     out = []
-    in_ul = False
-    in_ol = False
+    in_list = False
     for line in lines:
-        ul_m = re.match(r'^(\s*)[-*]\s+(.+)', line)
-        ol_m = re.match(r'^(\s*)\d+\.\s+(.+)', line)
-        if ul_m:
-            if not in_ul:
+        m = re.match(r'^(\s*)(?:[-*]|\d+\.)\s+(.+)', line)
+        if m:
+            if not in_list:
                 out.append("<ul>")
-                in_ul = True
-            if in_ol:
-                out.append("</ol>")
-                in_ol = False
-            out.append("<li>{0}</li>".format(ul_m.group(2)))
-        elif ol_m:
-            if not in_ol:
-                out.append("<ol>")
-                in_ol = True
-            if in_ul:
-                out.append("</ul>")
-                in_ul = False
-            out.append("<li>{0}</li>".format(ol_m.group(2)))
+                in_list = True
+            out.append("<li>{0}</li>".format(m.group(2)))
         else:
-            if in_ul:
+            if in_list:
                 out.append("</ul>")
-                in_ul = False
-            if in_ol:
-                out.append("</ol>")
-                in_ol = False
+                in_list = False
             out.append(line)
-    if in_ul:
+    if in_list:
         out.append("</ul>")
-    if in_ol:
-        out.append("</ol>")
     text = "\n".join(out)
 
     # 9. Paragraphs: double newlines → <p>; single newlines → <br>
     #    Code-block placeholders (\x00CBN\x00) must NOT be wrapped in <p> because
     #    after restoration they become <pre> blocks — and <p><pre> is invalid HTML
     #    that Swing's HTMLEditorKit renders incorrectly.
-    _CB_PH_RE = re.compile(r'\x00CB\d+\x00')
+    _CB_PH_RE = re.compile(r'\x00CB\d+\x00')  # fenced blocks only (inline code is \x00IC..\x00)
+    # Block-level markup that must be a bare sibling, never wrapped in <p>. Matched
+    # per LINE (not just at the block start) so a list/table/hr that follows prose
+    # or a heading WITHOUT a blank line between them is still split out correctly —
+    # otherwise the whole block fell through to the prose branch and produced invalid
+    # <p><ul>..</ul></p> with stray <br>s between the <li> tags.
+    _BLOCK_LINE_RE = re.compile(
+        r'^\s*</?(?:ul|ol|li|pre|hr|blockquote|table|thead|tbody|tr|td|th)\b')
     paragraphs = re.split(r'\n{2,}', text)
     result = []
     for p in paragraphs:
         p = p.strip()
         if not p:
             continue
-        # Block-level HTML tags — emit as-is (must NOT be wrapped in <p>)
-        if re.match(r'^<(ul|ol|li|pre|hr|blockquote|table)', p):
-            result.append(p)
-        # Paragraph that contains a code-block placeholder — split on it so that
-        # surrounding prose gets <p> wrapping and the placeholder stays bare
-        elif _CB_PH_RE.search(p):
-            parts = _CB_PH_RE.split(p)
-            phs   = _CB_PH_RE.findall(p)
-            for i, chunk in enumerate(parts):
-                chunk = chunk.strip()
-                if chunk:
-                    chunk = chunk.replace("\n", "<br>")
-                    result.append("<p>{0}</p>".format(chunk))
-                if i < len(phs):
-                    result.append(phs[i])   # bare placeholder → becomes <pre>
-        else:
-            p = p.replace("\n", "<br>")
-            result.append("<p>{0}</p>".format(p))
+        prose = []   # run of consecutive prose lines, joined with <br> into one <p>
+        for line in p.split("\n"):
+            ls = line.strip()
+            if not ls:
+                continue
+            ph_full = _CB_PH_RE.match(ls)
+            if _BLOCK_LINE_RE.match(ls) or (ph_full and ph_full.group(0) == ls):
+                # Block-level markup / whole-line code placeholder → bare sibling.
+                if prose:
+                    result.append("<p>{0}</p>".format("<br>".join(prose)))
+                    prose = []
+                result.append(ls)
+            elif _CB_PH_RE.search(ls):
+                # Inline fenced-block placeholder mid-line: split prose around it.
+                if prose:
+                    result.append("<p>{0}</p>".format("<br>".join(prose)))
+                    prose = []
+                parts = _CB_PH_RE.split(ls)
+                phs   = _CB_PH_RE.findall(ls)
+                for idx, chunk in enumerate(parts):
+                    chunk = chunk.strip()
+                    if chunk:
+                        result.append("<p>{0}</p>".format(chunk))
+                    if idx < len(phs):
+                        result.append(phs[idx])   # bare placeholder → becomes <pre>
+            else:
+                prose.append(ls)
+        if prose:
+            result.append("<p>{0}</p>".format("<br>".join(prose)))
     html = "\n".join(result)
 
     # 10. Restore code block / inline code placeholders
@@ -370,8 +374,28 @@ class AgenticBurpIssue(IScanIssue):
     def getBackgroundMarkdown(self):     return self._background or ""
     def getRemediationMarkdown(self):    return self._remediation or ""
 
+    # Mutators — used by the self-verification pass to adjust a finding in place.
+    def set_name(self, name):             self._name = name
+    def set_confidence(self, confidence): self._confidence = confidence
+    def append_detail(self, md):          self._detail = (self._detail or u"") + md
+
 
 # ── Parser ─────────────────────────────────────────────────────────────────────
+
+def _split_h1_sections(text):
+    """Return each top-level '# ' section as a string.
+
+    Uses finditer + slicing instead of re.split, because Jython/Python 2.7's
+    re.split never splits on a zero-width lookahead — so the old
+    re.split('(?=^# )', ...) returned the whole document as ONE section and
+    collapsed multi-finding responses into a single finding.
+    """
+    positions = [m.start() for m in re.finditer(u'(?m)^#\\s', text)]
+    if not positions:
+        return []
+    positions.append(len(text))
+    return [text[positions[i]:positions[i + 1]] for i in range(len(positions) - 1)]
+
 
 class ReportGenerator(object):
     def __init__(self, callbacks):
@@ -408,8 +432,39 @@ class ReportGenerator(object):
         # Normalise line endings
         ai_text = ai_text.replace(u"\r\n", u"\n").replace(u"\r", u"\n")
 
-        # Split on top-level # headings (single #, not ##/###)
-        parts = re.split(u'(?m)(?=^# )', ai_text.strip())
+        # Robustness: some models ignore the "# heading per finding" instruction
+        # and use ## as their top level instead. When there is no single-# heading
+        # anywhere but ## headings exist, promote ## -> # so the standard parser
+        # can read them. The exact-match subsection filter below prevents promoted
+        # "## Evidence" / "## Remediation" blocks from becoming bogus findings.
+        if not re.search(u'(?m)^#\\s', ai_text) and re.search(u'(?m)^##\\s', ai_text):
+            ai_text = re.sub(u'(?m)^##\\s', u'# ', ai_text)
+
+        # Section names that are PART of a finding, never a finding themselves.
+        _SUBSECTIONS = set([
+            u"evidence", u"attack scenario", u"proof of concept", u"poc",
+            u"root cause", u"remediation", u"issue detail", u"issue background",
+            u"impact", u"references", u"description", u"details", u"background",
+        ])
+
+        skip_keywords = [
+            u"analysis instruction", u"target information",
+            u"http request", u"http response", u"note:",
+            u"analysis results", u"executive summary",
+            u"vulnerability summary", u"overall", u"conclusion",
+            u"out-of-band", u"phase ", u"reconnaissance",
+            u"penetration test", u"pentest", u"test report",
+            u"security assessment", u"security report",
+            u"web application", u"assessment report",
+            u"findings report", u"audit report",
+        ]
+
+        # Split on top-level # headings (single #, not ##/###).
+        # NOTE: Jython/Python 2.7 re.split does NOT split on a zero-width
+        # lookahead match, so `re.split('(?=^# )', ...)` returns the whole string
+        # as one piece — which silently collapsed every multi-finding response
+        # into a single finding. Slice manually at each heading instead.
+        parts = _split_h1_sections(ai_text.strip())
 
         for part in parts:
             part = part.strip()
@@ -421,6 +476,27 @@ class ReportGenerator(object):
             if not name_match:
                 continue
 
+            raw_heading = _to_unicode(name_match.group(1)).strip().lower()
+
+            # "No vulnerabilities" is the prescribed clean-assessment conclusion.
+            # Turn it into a clearly-named Information finding instead of skipping
+            # it (which used to collapse to a generic "AI Analysis Result").
+            if (u"no vulnerabilit" in raw_heading or u"no issues" in raw_heading
+                    or u"no security issue" in raw_heading or u"no findings" in raw_heading):
+                issues.append(AgenticBurpIssue(
+                    http_service  = http_service,
+                    url           = url,
+                    http_messages = http_messages,
+                    name          = u"No Vulnerabilities Identified",
+                    detail        = part,
+                    background    = u"AgenticBurp AI analysis found no vulnerabilities on this request.",
+                    remediation   = (u"No action required for this request. Consider authenticated "
+                                     u"testing and JavaScript analysis for fuller coverage."),
+                    severity      = u"Information",
+                    confidence    = u"Firm",
+                ))
+                continue
+
             name = _to_unicode(name_match.group(1)).strip()
             # Strip " -- [Affected Parameter/Component]" suffix from name
             if u' -- ' in name:
@@ -428,19 +504,11 @@ class ReportGenerator(object):
             # Remove Markdown formatting and stray brackets from name
             name = re.sub(u'[\\*_`\\[\\]]', u'', name).strip()
 
-            # Skip template/meta headings that the AI may echo back
             lower_name = name.lower()
-            skip_keywords = [
-                u"analysis instruction", u"target information",
-                u"http request", u"http response", u"note:",
-                u"analysis results", u"executive summary",
-                u"vulnerability summary", u"overall", u"conclusion",
-                u"out-of-band", u"phase ", u"reconnaissance",
-                u"penetration test", u"pentest", u"test report",
-                u"security assessment", u"security report",
-                u"web application", u"assessment report",
-                u"findings report", u"audit report",
-            ]
+            # A promoted subsection heading is not a finding.
+            if lower_name in _SUBSECTIONS:
+                continue
+            # Skip template/meta headings that the AI may echo back
             if any(kw in lower_name for kw in skip_keywords):
                 continue
 
@@ -510,9 +578,19 @@ class ReportGenerator(object):
             severity   = _normalize_severity(severity_raw)
             confidence = _normalize_confidence(confidence_raw)
 
+            # Anti-hallucination: this extension analyses PASSIVELY -- it never
+            # sends the actual payload -- so a finding the AI could not confirm
+            # from the provided request/response is a hypothesis, not a proven
+            # bug. The AI signals that with Confidence=Tentative. Prefix such
+            # findings with "Potential" so an unverified High doesn't read like a
+            # proven one. A finding whose response genuinely contains the evidence
+            # (reflected value, error, missing header, disclosed data) should be
+            # marked Certain/Firm by the AI and keeps its plain name.
             display_name = name
+            if confidence == u"Tentative" and not display_name.lower().startswith(u"potential"):
+                display_name = u"Potential " + display_name
             if cve_raw and cve_raw.upper() != u"N/A":
-                display_name = u"{0} [{1}]".format(name, cve_raw)
+                display_name = u"{0} [{1}]".format(display_name, cve_raw)
 
             issue = AgenticBurpIssue(
                 http_service  = http_service,

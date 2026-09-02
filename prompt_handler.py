@@ -56,7 +56,11 @@ Step 6 -- REMEDIATION:
 4. If no vulnerability is found, provide a security assessment explaining the observed security controls and what is working correctly.
 5. Output MUST be structured Markdown. Each finding as a separate top-level # heading. NEVER output a report title or wrapper heading -- start directly with the first vulnerability finding.
 6. Findings MUST be ordered by severity: Critical -> High -> Medium -> Low -> Informational.
-7. Assign confidence: Certain (reproducible with provided data), Firm (strong indicators, minor assumptions), Tentative (theoretical attack surface, no direct evidence).
+7. Assign confidence HONESTLY -- this drives how the finding is labelled:
+   - Certain: the provided response CONTAINS direct evidence (reflected payload, stack trace / error, disclosed data like /etc/passwd contents, a missing security header you can see in the headers).
+   - Firm: strong indicators in the provided data with only minor assumptions.
+   - Tentative: a hypothesis based on parameter names or structure that you CANNOT confirm from the passive request/response (e.g. inferring LFI/SQLi/SSRF from a parameter without an actual payload response). This tool does NOT send payloads, so anything requiring active testing is Tentative.
+   Findings you mark Tentative are automatically labelled "Potential <name>" -- that is correct and expected. Do NOT mark something Certain/Firm unless the evidence is actually present in the data you were given.
 8. Include CVSS 3.1 vector string where possible, not just the score.
 9. For any CVE referenced, confirm it matches the observed version/component before citing it."""
 
@@ -436,7 +440,7 @@ CRITICAL FORMATTING RULES:
 - Do NOT output a report title, document header, or executive summary.
 - Do NOT wrap findings inside a parent heading like "# Report" or "# Analysis".
 - Your response MUST start directly with the first finding (a `# Vulnerability Name` heading).
-- If nothing is found, start directly with `# Security Assessment -- No Vulnerabilities Identified`.
+- If nothing is found, output EXACTLY one finding starting with `# No Vulnerabilities Identified`.
 - The ONLY top-level `#` headings allowed are individual vulnerability names.
 
 Output ALL findings ordered: Critical > High > Medium > Low > Informational.
@@ -497,9 +501,9 @@ import requests
 
 ---
 
-If NO vulnerabilities are found, output a security assessment section:
+If NO vulnerabilities are found, output EXACTLY this single finding (start with it directly):
 
-# Security Assessment -- No Vulnerabilities Identified
+# No Vulnerabilities Identified
 
 Explain:
 1. What security controls were observed and are functioning correctly

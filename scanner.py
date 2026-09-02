@@ -7,6 +7,7 @@
 # Includes: scope filtering, request deduplication, Burp Collaborator support.
 
 import hashlib
+import re
 import threading
 from javax.swing import SwingUtilities
 from prompt_handler import PromptHandler
@@ -73,6 +74,105 @@ class Scanner(object):
             return self._collaborator.generatePayload(True)
         except Exception:
             return ""
+
+    # ── Self-verification (second AI pass) ─────────────────────────────────────
+
+    def _verify_findings(self, issues, response_bytes, provider, settings, max_tokens):
+        """Judge each actionable finding ONLY on the response evidence.
+          CONFIRMED      -> keep, annotate.
+          POTENTIAL      -> prefix "Potential", set Confidence=Tentative, annotate.
+          FALSE_POSITIVE -> drop.
+        Information / error findings pass through untouched. Fails open: any error
+        (or unparseable verdicts) returns the input list unchanged so findings are
+        never lost to a flaky verification call."""
+        actionable = [i for i, iss in enumerate(issues)
+                      if iss.getSeverity() in ("High", "Medium", "Low")]
+        if not actionable:
+            return issues
+
+        try:
+            resp_text = self._helpers.bytesToString(response_bytes) if response_bytes else u""
+        except Exception:
+            resp_text = u""
+        resp_text = resp_text[:4000]
+
+        lines = []
+        for i in actionable:
+            iss = issues[i]
+            claim = (iss.getDetailMarkdown() or u"").replace("\n", " ")[:200]
+            lines.append(u"{0}. [{1}] {2} | claim: {3}".format(
+                i, iss.getSeverity(), iss.getIssueName(), claim))
+
+        sys_p = (
+            u"You are a strict, skeptical verifier of web application security findings. "
+            u"For each finding decide, using ONLY the HTTP response provided, whether the "
+            u"evidence truly supports it. Output one line per finding and NOTHING else, "
+            u"in exactly this form:\n"
+            u"<index>: CONFIRMED|POTENTIAL|FALSE_POSITIVE - <reason, max 12 words>\n"
+            u"CONFIRMED = the response contains concrete proof (reflected payload, error "
+            u"message, disclosed data, or the insecure/missing header actually present). "
+            u"POTENTIAL = plausible from the request but NOT proven in this response. "
+            u"FALSE_POSITIVE = the response contradicts it or gives no basis at all. "
+            u"Be conservative: when unsure use POTENTIAL, never CONFIRMED.")
+        user_p = (u"FINDINGS:\n" + u"\n".join(lines)
+                  + u"\n\nHTTP RESPONSE:\n" + (resp_text or u"(empty response)"))
+
+        try:
+            cap = int(max_tokens) if max_tokens else 1000
+        except Exception:
+            cap = 1000
+        verdict_text = self.api_client.call_api(
+            provider=provider, settings=settings,
+            system_prompt=sys_p, user_prompt=user_p,
+            max_tokens=min(cap, 1200))
+
+        verdicts = self._parse_verdicts(verdict_text)
+        if not verdicts:
+            self._log("Self-verify: no parseable verdicts — keeping findings as-is.")
+            return issues
+
+        kept = []
+        for i, iss in enumerate(issues):
+            v = verdicts.get(i)
+            if v is None:
+                kept.append(iss)                      # not judged -> keep unchanged
+                continue
+            verdict, reason = v
+            if verdict == "FALSE_POSITIVE":
+                self._log(u"Self-verify DROP [{0}] {1} - {2}".format(
+                    iss.getSeverity(), iss.getIssueName(), reason))
+                continue
+            if verdict == "POTENTIAL":
+                nm = iss.getIssueName()
+                if not nm.lower().startswith("potential"):
+                    iss.set_name(u"Potential " + nm)
+                iss.set_confidence(u"Tentative")
+                iss.append_detail(
+                    u"\n\n> **Self-verify:** not proven in the response — " + reason)
+            else:  # CONFIRMED
+                iss.append_detail(
+                    u"\n\n> **Self-verify:** confirmed against the response — " + reason)
+            kept.append(iss)
+        return kept
+
+    def _parse_verdicts(self, text):
+        """Parse '<index>: VERDICT - reason' lines into {index: (VERDICT, reason)}."""
+        out = {}
+        if not text:
+            return out
+        pat = re.compile(
+            r'^\s*(\d+)\s*[:.\)\-]\s*'
+            r'(CONFIRMED|POTENTIAL|FALSE[_ ]?POSITIVE)\b[\s:\-]*(.*)$',
+            re.IGNORECASE)
+        for line in text.split("\n"):
+            m = pat.match(line)
+            if not m:
+                continue
+            idx     = int(m.group(1))
+            verdict = m.group(2).upper().replace(" ", "_")
+            reason  = (m.group(3) or "").strip()[:160]
+            out[idx] = (verdict, reason)
+        return out
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -243,6 +343,19 @@ class Scanner(object):
                 url          = request_info.getUrl(),
                 http_messages= [marked_message],
             )
+
+            # Optional second pass: judge each finding against the actual response
+            # evidence — unproven findings are downgraded to "Potential" and refuted
+            # ones dropped. Strengthens the anti-hallucination posture. Fails open.
+            try:
+                if issues and self.ui.get_self_verify():
+                    before = len(issues)
+                    issues = self._verify_findings(
+                        issues, response_bytes, provider, settings, max_tokens)
+                    self._log("Self-verify: {0} -> {1} finding(s) for {2}".format(
+                        before, len(issues), url))
+            except Exception as ve:
+                self._log("Self-verify skipped (error): {0}".format(str(ve)))
 
             for issue in issues:
                 try:

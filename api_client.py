@@ -1,15 +1,104 @@
 # -*- coding: utf-8 -*-
 # AgenticBurp - AI-Powered Security Analysis for Burp Suite
 # api_client.py — Multi-provider LLM client
-# Providers: Anthropic (Claude), OpenAI, OpenRouter, Ollama, Gemini
+# Providers: Anthropic (Claude), OpenAI, OpenRouter, Ollama, Gemini,
+#            DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI (Grok)
 # Written for Jython 2.7 (Burp Suite Python extension environment)
 
 import json
+import re
 import time
 
 # Use Java's networking stack for robust HTTPS/SSL support in Jython
 from java.net import URL
 from java.io import BufferedReader, InputStreamReader
+
+
+# ── OpenAI-compatible providers ─────────────────────────────────────────────────
+#
+# DeepSeek, Kimi/Moonshot, Mistral, Groq and xAI all speak the OpenAI
+# chat-completions protocol, so they share one code path — only the base URL,
+# default model and sign-up link differ. Kept as an ordered list of tuples (NOT
+# a dict) because Jython 2.7 dicts don't preserve insertion order and the UI
+# renders these tabs in this order.
+#
+# Each entry: (label, base_url, default_model, key_url, model_hint)
+# Model fields are free text: these vendors rotate model IDs often, so a fixed
+# dropdown would go stale — the default is a documented, long-lived ID.
+OAI_COMPAT_PROVIDERS = [
+    ("DeepSeek", "https://api.deepseek.com", "deepseek-chat",
+     "platform.deepseek.com",
+     "deepseek-chat (V3, general)  |  deepseek-reasoner (R1, chain-of-thought)"),
+    ("Kimi (Moonshot)", "https://api.moonshot.ai/v1", "moonshot-v1-8k",
+     "platform.moonshot.ai",
+     "moonshot-v1-8k / -32k / -128k  |  kimi-k2-0711-preview  (see platform.moonshot.ai/console)"),
+    ("Mistral", "https://api.mistral.ai/v1", "mistral-large-latest",
+     "console.mistral.ai",
+     "mistral-large-latest  |  mistral-small-latest  |  codestral-latest"),
+    ("Groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile",
+     "console.groq.com/keys",
+     "llama-3.3-70b-versatile  |  llama-3.1-8b-instant  |  (very fast inference)"),
+    ("xAI (Grok)", "https://api.x.ai/v1", "grok-2-latest",
+     "console.x.ai",
+     "grok-2-latest  |  grok-2-vision-latest  |  grok-beta"),
+    # OpenCode Zen — a hosted model gateway. OpenAI-compatible at /zen/v1.
+    ("OpenCode Zen", "https://opencode.ai/zen/v1", "claude-sonnet-4-5",
+     "opencode.ai/zen",
+     "Pick a model from opencode.ai/zen (e.g. claude-sonnet-4-5, gpt-5-codex, kimi-k2)"),
+]
+
+# label -> (base_url, default_model) for O(1) dispatch lookup
+OAI_COMPAT_MAP = dict((p[0], (p[1], p[2])) for p in OAI_COMPAT_PROVIDERS)
+
+# Stable settings-key prefix per provider. Explicit (not derived from the label)
+# so a future label tweak can't silently orphan a user's saved key.
+OAI_COMPAT_KEYS = {
+    "DeepSeek":        "deepseek",
+    "Kimi (Moonshot)": "kimi",
+    "Mistral":         "mistral",
+    "Groq":            "groq",
+    "xAI (Grok)":      "xai",
+    "OpenCode Zen":    "opencode",
+}
+
+
+def _settings_key(provider_label):
+    return OAI_COMPAT_KEYS.get(provider_label, provider_label.lower())
+
+
+def _oai_error_message(body):
+    """Pull a human-readable error out of an OpenAI-compatible error body.
+
+    Handles both the standard {"error": {"message": ...}} shape and nested
+    variants like OpenCode Zen's {"error": {"type": "CreditsError", "message": ...}}.
+    Returns "" when nothing useful can be extracted.
+    """
+    try:
+        d = json.loads(body)
+    except Exception:
+        return ""
+    err = d.get("error")
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("type") or "")
+    if isinstance(err, str):
+        return err
+    if isinstance(d.get("message"), str):
+        return d["message"]
+    return ""
+
+
+def _chat_completions_url(base_url):
+    """Build the chat/completions URL from a base, tolerating an optional /v1.
+
+    Some vendors publish their base WITH the version segment (Moonshot:
+    https://api.moonshot.ai/v1) and some WITHOUT (DeepSeek:
+    https://api.deepseek.com). Normalise so we never emit /v1/v1/chat/completions
+    or a bare /chat/completions against a versionless host.
+    """
+    root = (base_url or "").rstrip("/")
+    if root.endswith("/v1"):
+        return root + "/chat/completions"
+    return root + "/v1/chat/completions"
 
 
 # ── HTTP helper ────────────────────────────────────────────────────────────────
@@ -97,18 +186,39 @@ def _http_get(url_str, headers, timeout_ms=10000):
         raise RuntimeError("HTTP GET failed: {0}".format(str(e)))
 
 
+_RETRY_AFTER_RE = re.compile(r'try again in\s+(?:(\d+)m)?\s*([\d.]+)\s*s', re.IGNORECASE)
+
+
+def _parse_retry_seconds(body):
+    """Extract a provider-suggested wait (seconds) from a 429 body, e.g. Groq's
+    'Please try again in 7.66s' or '... in 1m30s'. Capped at 30s so Burp's UI
+    thread never hangs on a long daily-limit backoff. Returns None if not found."""
+    try:
+        m = _RETRY_AFTER_RE.search(body or "")
+        if m:
+            mins = float(m.group(1)) if m.group(1) else 0.0
+            return min(mins * 60.0 + float(m.group(2)) + 0.5, 30.0)
+    except Exception:
+        pass
+    return None
+
+
 def _http_post_with_retry(url_str, headers, body_str, timeout_ms=120000,
-                           max_retries=3):
+                           max_retries=4):
     """
-    Wrapper around _http_post with exponential backoff on 429 (rate limit).
-    Retries up to max_retries times: waits 2s, 4s, 8s between attempts.
+    Wrapper around _http_post with backoff on 429 (rate limit). Honours the wait
+    the provider suggests in the body ('try again in Xs' — Groq/OpenAI style),
+    falling back to exponential 2/4/8s. Returns the LAST (status, body) so the
+    caller can surface the provider's real rate-limit message.
     """
     last_exc = None
+    status, body = 0, ""
     for attempt in range(max_retries):
         try:
             status, body = _http_post(url_str, headers, body_str, timeout_ms)
-            if status == 429:
-                wait = 2 ** (attempt + 1)   # 2, 4, 8 seconds
+            if status == 429 and attempt < max_retries - 1:
+                suggested = _parse_retry_seconds(body)
+                wait = suggested if suggested is not None else min(2 ** (attempt + 1), 16)
                 time.sleep(wait)
                 continue
             return status, body
@@ -118,7 +228,7 @@ def _http_post_with_retry(url_str, headers, body_str, timeout_ms=120000,
                 time.sleep(2 ** attempt)
     if last_exc:
         raise last_exc
-    return 429, "[Rate limited after {0} retries]".format(max_retries)
+    return status, body
 
 
 # ── API Client ─────────────────────────────────────────────────────────────────
@@ -189,6 +299,96 @@ class APIClient(object):
             return (choices[0].get("message") or {}).get("content") or ""
         except Exception as e:
             return "[OpenAI Exception] {0}".format(str(e))
+
+    # ── Generic OpenAI-compatible (DeepSeek, Kimi, Mistral, Groq, xAI) ──────────
+
+    def call_openai_compatible(self, provider_label, base_url, api_key, model,
+                               system_prompt, user_prompt, max_tokens):
+        """One chat-completions call for any OpenAI-compatible vendor."""
+        if not api_key:
+            return "[{0}] No API key set. Add one in Settings.".format(provider_label)
+        url = _chat_completions_url(base_url)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer {0}".format(api_key),
+        }
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        }
+        try:
+            status, body = _http_post_with_retry(url, headers, json.dumps(payload))
+            if status == 401:
+                # 401 is not always a bad key -- e.g. OpenCode Zen returns 401 with
+                # a "No payment method / CreditsError" body. Surface the provider's
+                # actual message instead of blaming the key.
+                detail = _oai_error_message(body)
+                if detail:
+                    return "[{0} Error 401] {1}".format(provider_label, detail)
+                return ("[{0} Error 401] Invalid API key. "
+                        "Check your key on the provider dashboard.").format(provider_label)
+            if status == 402:
+                return ("[{0} Error 402] Insufficient credits or quota. "
+                        "Top up your account or lower Max Tokens.").format(provider_label)
+            if status == 404:
+                return ("[{0} Error 404 - Model Not Found]\n"
+                        "Model '{1}' is not available. Check the exact model ID on the "
+                        "provider's docs and update it in Settings.").format(provider_label, model)
+            if status == 429:
+                detail = _oai_error_message(body)
+                msg = detail[:300] if detail else "rate/token-per-minute limit reached"
+                return ("[{0} Error 429 - Rate Limited] {1}\n"
+                        "Retried with backoff but still limited. Free tiers (esp. Groq) "
+                        "cap tokens-per-minute — lower Max Tokens in Settings, wait a "
+                        "minute, pick a smaller/faster model, or upgrade your plan."
+                        ).format(provider_label, msg)
+            if status != 200:
+                return "[{0} Error {1}] {2}".format(provider_label, status, body[:500])
+            result = json.loads(body)
+            choices = result.get("choices") or []
+            if not choices:
+                # Some gateways answer 200 with an {"error": ...} body instead of 4xx.
+                err = result.get("error")
+                if err:
+                    detail = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    return "[{0} Error] {1}".format(provider_label, detail[:400])
+                return "[{0}] No choices in response.".format(provider_label)
+            return (choices[0].get("message") or {}).get("content") or ""
+        except Exception as e:
+            return "[{0} Exception] {1}".format(provider_label, str(e))
+
+    def test_openai_compatible(self, provider_label, base_url, api_key, model):
+        if not api_key:
+            return False, "No API key"
+        url = _chat_completions_url(base_url)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer {0}".format(api_key),
+        }
+        payload = {"model": model, "max_tokens": 1,
+                   "messages": [{"role": "user", "content": "Hi"}]}
+        try:
+            status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+            if status == 200:
+                return True, "Connected"
+            detail = _oai_error_message(body)
+            if status == 401:
+                # Distinguish a real auth failure from a billing/credits 401.
+                if detail and ("payment" in detail.lower() or "credit" in detail.lower()
+                               or "billing" in detail.lower()):
+                    return False, "Key OK but no credits: " + detail[:80]
+                return False, detail[:90] if detail else "Invalid API key (401)"
+            if status == 404:
+                return False, "Model not found (404) - check model ID"
+            return False, "HTTP {0}: {1}".format(status, (detail or body[:80])[:80])
+        except Exception as e:
+            return False, str(e)[:120]
 
     # ── OpenRouter ─────────────────────────────────────────────────────────────
 
@@ -275,11 +475,16 @@ class APIClient(object):
 
     # ── Ollama ─────────────────────────────────────────────────────────────────
 
-    def call_ollama(self, base_url, model, system_prompt, user_prompt, max_tokens):
-        url = base_url.rstrip("/") + "/v1/chat/completions"
+    def call_ollama(self, base_url, model, system_prompt, user_prompt, max_tokens,
+                    api_key=None):
+        # Tolerate a base that already ends in /v1 (e.g. a custom cloud host) so
+        # we never emit /v1/v1/chat/completions.
+        url = _chat_completions_url(base_url)
+        # Local Ollama ignores the key but the SDK needs a non-empty value; the
+        # hosted service (ollama.com) authenticates with a real bearer token.
         headers = {
             "Content-Type": "application/json",
-            "Authorization": "Bearer ollama",
+            "Authorization": "Bearer {0}".format(api_key if api_key else "ollama"),
         }
         messages = []
         if system_prompt:
@@ -434,9 +639,33 @@ class APIClient(object):
         except Exception as e:
             return False, str(e)[:120]
 
-    def test_ollama(self, base_url, model):
+    def test_ollama(self, base_url, model, api_key=None):
         if not base_url:
             return False, "No base URL"
+
+        # Cloud mode: /api/tags may not exist on the hosted service, so probe the
+        # OpenAI-compatible chat endpoint with the key instead.
+        if api_key:
+            url = _chat_completions_url(base_url)
+            headers = {"Content-Type": "application/json",
+                       "Authorization": "Bearer {0}".format(api_key)}
+            payload = {"model": model, "max_tokens": 1,
+                       "messages": [{"role": "user", "content": "Hi"}]}
+            try:
+                status, body = _http_post(url, headers, json.dumps(payload), timeout_ms=15000)
+                if status == 200:
+                    return True, "Connected (cloud)"
+                if status == 401:
+                    return False, "Invalid API key (401)"
+                try:
+                    msg = json.loads(body).get("error", {}).get("message", body[:80])
+                except Exception:
+                    msg = body[:80]
+                return False, "HTTP {0}: {1}".format(status, str(msg)[:70])
+            except Exception as e:
+                return False, str(e)[:120]
+
+        # Local mode: list models via /api/tags.
         url = base_url.rstrip("/") + "/api/tags"
         try:
             status, body = _http_get(url, {}, timeout_ms=8000)
@@ -494,9 +723,32 @@ class APIClient(object):
                 max_tokens=max_tokens,
             )
         elif provider == "Ollama":
+            # Two modes: "local" (self-hosted, no auth) and "cloud" (ollama.com,
+            # API key required). Base URL defaults to the mode's conventional host.
+            mode = (settings.get("ollama_mode", "local") or "local").lower()
+            if mode == "cloud":
+                base = settings.get("ollama_base_url", "") or "https://ollama.com"
+                key  = settings.get("ollama_api_key", "")
+            else:
+                base = settings.get("ollama_base_url", "") or "http://localhost:11434"
+                key  = None
             return self.call_ollama(
-                base_url=settings.get("ollama_base_url", "http://localhost:11434"),
+                base_url=base,
                 model=settings.get("ollama_model", "qwen2.5-coder:7b"),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+                api_key=key,
+            )
+        elif provider in OAI_COMPAT_MAP:
+            # DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI — all one code path.
+            base_default, model_default = OAI_COMPAT_MAP[provider]
+            key = _settings_key(provider)
+            return self.call_openai_compatible(
+                provider_label=provider,
+                base_url=settings.get(key + "_base", base_default),
+                api_key=settings.get(key + "_key", ""),
+                model=settings.get(key + "_model", model_default),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,

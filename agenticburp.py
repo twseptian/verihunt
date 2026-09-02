@@ -42,7 +42,7 @@ from ui import UI
 from scanner import Scanner
 
 EXTENSION_NAME = "AgenticBurp"
-EXTENSION_VERSION = "1.0.0"
+EXTENSION_VERSION = "1.2.0"
 
 
 class BurpExtender(IBurpExtender, IContextMenuFactory, ITab):
@@ -56,7 +56,7 @@ class BurpExtender(IBurpExtender, IContextMenuFactory, ITab):
         callbacks.setExtensionName(EXTENSION_NAME + " v" + EXTENSION_VERSION)
 
         try:
-            self.ui = UI(callbacks)
+            self.ui = UI(callbacks, EXTENSION_VERSION)
             self.scanner = Scanner(callbacks, self.ui)
             callbacks.registerContextMenuFactory(self)
             callbacks.addSuiteTab(self)

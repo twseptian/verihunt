@@ -1,4 +1,4 @@
-# AgenticBurp
+# VeriHunt
 
 AI-Powered Security Analysis for Burp Suite — part of the **Agentic Web Pentest** project.
 
@@ -6,21 +6,37 @@ Analyze HTTP requests and responses directly inside Burp Suite using any major L
 
 ---
 
+## Features
+
+- **AI Analysis (Results tab)** — right-click any request → *Analyze with AI*. Single or **batch/queue** (select many in Proxy history → "Analyze N requests with AI", concurrent workers, live progress, Stop). Optional **Self-verify** second pass cuts false positives **without discarding attack-surface hypotheses** (Potential SQLi / auth-bypass / LFI / SSRF that a passive response can never prove are kept, not dropped). Re-analysing an endpoint no longer produces duplicate findings (de-dup by severity + URL + parameter). Findings become native Burp scan issues with Advisory + Analyzed Request/Response, Toggle False Positive, and an **AI Assistant chat**.
+- **AI Hunt (passive heuristics + enhanced AI triage)** — HUNT-style flagging of suspicious parameters across 12 vuln classes (SQLi, XSS, LFI/Path Traversal, SSRF, IDOR/BOLA, Command Injection, SSTI, XXE, Open Redirect, Deserialization, Mass-Assignment, Debug), plus a generic **"Other Parameter (review)"** catch-all so no user-controllable input is missed. Tick *Passive (Proxy)* to flag params as you browse, or press **Scan History** to run the heuristics over Burp's existing Proxy history retroactively — instant, free, no payloads, static assets skipped, off the proxy thread. Candidates are **POTENTIAL until validated**. Per-candidate Request/Response viewer + right-click **Deep Analyze (AI)** / Send to Repeater / Send to Intruder / Copy URL. **Triage (AI)** is evidence-grounded (reflection, SQL-error, stack-trace, status, content-type signals) → verdict + confidence % + evidence + tailored payloads + next step.
+- **Cross-Scan Memory** — remembers, per host, your false positives + AI-confirmed findings (persisted across restarts); later scans skip known FPs and stay aware of prior confirmations. Toggle with *Memory*; reset with *Clear Memory*.
+- **Reports & Export** — Export **JSON**, or **HTML / Markdown** reports (grouped by severity, PoC + remediation); right-click a finding → *Copy as Markdown*.
+- **Token Usage Tracker** — last-call + running session tokens in the Results header (TPM / quota awareness).
+- **12 providers**, per-provider tuning + *Test & Detect Models*, and Auto / Light / Dark theme.
+
+See the in-app **About** tab for full documentation.
+
+---
+
 ## Providers Supported
 
-| Provider    | Models                                                              |
+| Provider    | Models (defaults; editable, use *Test & Detect Models* for the live list) |
 |-------------|---------------------------------------------------------------------|
-| Anthropic   | claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5, claude-3.5-* |
-| OpenAI      | gpt-4o, gpt-4-turbo, gpt-4, o1, o1-mini, o3-mini                   |
+| Anthropic   | claude-sonnet-5, claude-opus-5, claude-haiku-4-5, claude-fable-5-1  |
+| OpenAI      | gpt-5.1, gpt-5, gpt-5-mini, gpt-4.1, gpt-4o, o3, o4-mini            |
 | OpenRouter  | Any 400+ models via unified API (free & paid)                       |
-| Gemini      | gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash                  |
+| Gemini      | gemini-2.5-flash/pro, gemini-2.5-flash-lite, gemini-3.x (preview)   |
 | Ollama      | Local server OR Ollama Cloud (ollama.com) — model + optional API key |
-| DeepSeek    | deepseek-chat (V3), deepseek-reasoner (R1)                          |
-| Kimi        | Moonshot moonshot-v1-8k/32k/128k, kimi-k2                           |
-| Mistral     | mistral-large, mistral-small, codestral                            |
-| Groq        | llama-3.3-70b, llama-3.1-8b (very fast inference)                   |
-| xAI (Grok)  | grok-2-latest, grok-2-vision, grok-beta                            |
-| OpenCode Zen| Gateway to 60+ models (claude-sonnet-4-5, gpt-5-codex, kimi-k2, ...) |
+| DeepSeek    | deepseek-chat (V-series), deepseek-reasoner                         |
+| Kimi        | Moonshot kimi-latest, kimi-k2, moonshot-v1-8k/32k/128k             |
+| Mistral     | mistral-large / medium / small, codestral                          |
+| Groq        | llama-3.3/4, openai/gpt-oss, moonshotai/kimi-k2 (very fast)         |
+| xAI (Grok)  | grok-4.6, grok-4.5, grok-4.3                                        |
+| OpenCode Zen| Gateway (claude-sonnet-5, gpt-5.1, kimi-k3, ...)                    |
+| Z.AI (GLM)  | glm-4.6 (flagship), glm-4.5 / -air / -flash (free tier)             |
+| Z.AI Coding Plan | Same GLM models - USE THIS entry for GLM Coding Plan keys (coding endpoint) |
+| Custom      | Any OpenAI-compatible gateway (LiteLLM, Azure-compatible, proxy) - set Base URL + Model |
 
 ---
 
@@ -31,11 +47,11 @@ Analyze HTTP requests and responses directly inside Burp Suite using any major L
 1. Download **Jython Standalone** JAR from https://www.jython.org/download
 2. In Burp Suite: **Extensions → Extensions Settings → Python Environment** → click **Select file** → choose the Jython JAR
 
-### 2. Install AgenticBurp
+### 2. Install VeriHunt
 
 1. In Burp Suite: **Extensions → Add**
 2. Set **Extension type**: Python
-3. Set **Extension file**: `agenticburp.py`
+3. Set **Extension file**: `verihunt.py`
 4. Set **Folder for loading modules**: the folder containing all `.py` files (this directory)
 5. Click **Next** — the extension loads without errors
 
@@ -43,9 +59,9 @@ Analyze HTTP requests and responses directly inside Burp Suite using any major L
 
 ## Configuration
 
-1. Open the **AgenticBurp** tab in Burp Suite
+1. Open the **VeriHunt** tab in Burp Suite
 2. Go to **Settings**
-3. Select your **Active Provider** (Anthropic / OpenAI / OpenRouter / Gemini / Ollama / DeepSeek / Kimi / Mistral / Groq / xAI / OpenCode Zen)
+3. Select your **Active Provider** (Anthropic / OpenAI / OpenRouter / Gemini / Ollama / DeepSeek / Kimi / Mistral / Groq / xAI / OpenCode Zen / Z.AI)
    - **Theme**: leave on *Auto* to follow Burp's Look & Feel, or force *Light* / *Dark* if the panels render with the wrong theme (applies immediately).
 4. Enter your API key in the provider's panel
 5. Select or type your model name
@@ -56,7 +72,7 @@ Analyze HTTP requests and responses directly inside Burp Suite using any major L
 ## Usage
 
 1. Browse target application (Proxy → HTTP history accumulates traffic)
-2. Right-click any request → **AgenticBurp → Analyze with AI**
+2. Right-click any request → **VeriHunt → Analyze with AI**
 3. The analysis runs in the background (UI stays responsive)
 4. Switch to the **Results** tab to view findings
 
@@ -140,7 +156,7 @@ The system prompt and analysis template are built for the Agentic Web Pentest pi
 
 ```
 burpversion/
-├── agenticburp.py      # Main BurpExtender entry point (load this in Burp)
+├── verihunt.py      # Main BurpExtender entry point (load this in Burp)
 ├── api_client.py       # Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama)
 ├── prompt_handler.py   # Advanced prompt engineering
 ├── scanner.py          # Background analysis orchestration

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AgenticBurp - AI-Powered Security Analysis for Burp Suite
+# VeriHunt - AI-Powered Security Analysis for Burp Suite
 # scanner.py — Analysis orchestration with background threading
 #
 # Supports both single-request and bulk multi-request scanning.
@@ -13,6 +13,7 @@ from javax.swing import SwingUtilities
 from prompt_handler import PromptHandler
 from api_client import APIClient
 from report_generator import ReportGenerator, _safe_log_str
+from memory import Memory
 
 
 class Scanner(object):
@@ -23,6 +24,7 @@ class Scanner(object):
         self.prompt_handler   = PromptHandler(callbacks)
         self.api_client       = APIClient()
         self.report_generator = ReportGenerator(callbacks)
+        self.memory           = Memory(callbacks)   # cross-scan FP / confirmed memory
         self.stdout = callbacks.getStdout()
 
         # Request deduplication: set of MD5 hashes of analyzed request bytes
@@ -111,9 +113,15 @@ class Scanner(object):
             u"<index>: CONFIRMED|POTENTIAL|FALSE_POSITIVE - <reason, max 12 words>\n"
             u"CONFIRMED = the response contains concrete proof (reflected payload, error "
             u"message, disclosed data, or the insecure/missing header actually present). "
-            u"POTENTIAL = plausible from the request but NOT proven in this response. "
-            u"FALSE_POSITIVE = the response contradicts it or gives no basis at all. "
-            u"Be conservative: when unsure use POTENTIAL, never CONFIRMED.")
+            u"POTENTIAL = plausible attack surface from the request/parameters but NOT "
+            u"proven in this response -- use this for anything that needs ACTIVE testing "
+            u"(SQL injection, auth/login bypass, LFI, SSRF, IDOR, command injection "
+            u"inferred from parameter names). A passive response cannot prove these, and "
+            u"absence of proof is NOT disproof. "
+            u"FALSE_POSITIVE = ONLY when the response ACTIVELY CONTRADICTS the finding "
+            u"(e.g. the header IS actually present, the parameter does not exist, the "
+            u"endpoint 404s). NEVER use FALSE_POSITIVE merely because proof is absent. "
+            u"Be conservative: when unsure use POTENTIAL, never CONFIRMED or FALSE_POSITIVE.")
         user_p = (u"FINDINGS:\n" + u"\n".join(lines)
                   + u"\n\nHTTP RESPONSE:\n" + (resp_text or u"(empty response)"))
 
@@ -139,9 +147,22 @@ class Scanner(object):
                 continue
             verdict, reason = v
             if verdict == "FALSE_POSITIVE":
-                self._log(u"Self-verify DROP [{0}] {1} - {2}".format(
-                    iss.getSeverity(), iss.getIssueName(), reason))
-                continue
+                # Absence of proof is not disproof. A passive response can't refute an
+                # attack-surface hypothesis (SQLi / auth-bypass / LFI / SSRF inferred
+                # from parameters), so NEVER drop a Tentative / already-"Potential"
+                # finding -- keep it as POTENTIAL. Only drop confidently-asserted
+                # findings the response actually contradicts.
+                try:
+                    was_tentative = (
+                        (iss.getConfidence() or u"").lower() == u"tentative"
+                        or (iss.getIssueName() or u"").lower().startswith(u"potential"))
+                except Exception:
+                    was_tentative = False
+                if not was_tentative:
+                    self._log(u"Self-verify DROP [{0}] {1} - {2}".format(
+                        iss.getSeverity(), iss.getIssueName(), reason))
+                    continue
+                verdict = "POTENTIAL"   # keep attack-surface hypothesis, downgraded
             if verdict == "POTENTIAL":
                 nm = iss.getIssueName()
                 if not nm.lower().startswith("potential"):
@@ -213,6 +234,16 @@ class Scanner(object):
             self._start_single(valid[0])
         else:
             self._start_bulk(valid)
+
+    def analyze_message(self, message):
+        """Public single-message entry point (used by AI Hunt -> Deep Analyze).
+        Runs the FULL Results analysis pipeline on one captured exchange."""
+        try:
+            if message is None or message.getRequest() is None:
+                return
+            self._start_single(message)
+        except Exception as e:
+            self._log("Deep analyze failed: {0}".format(str(e)))
 
     # ── Single analysis ────────────────────────────────────────────────────────
 
@@ -313,6 +344,19 @@ class Scanner(object):
             # Get Collaborator payload for OOB detection hints
             collab_url = self._get_collaborator_payload()
 
+            # Cross-scan memory: host context (known FPs + prior confirmed).
+            try:
+                _url_obj = request_info.getUrl()
+                host = _url_obj.getHost()
+                path = _url_obj.getPath()
+            except Exception:
+                host = u""; path = u""
+            try:
+                use_mem = self.ui.get_use_memory()
+            except Exception:
+                use_mem = True
+            mem_ctx = self.memory.context_for(host) if use_mem else u""
+
             system_prompt, user_prompt = self.prompt_handler.build_prompts(
                 prompt_template   = prompt_tmpl,
                 request_bytes     = request_bytes,
@@ -321,6 +365,7 @@ class Scanner(object):
                 max_request_chars = 3000,
                 max_response_chars= 2000,
                 collaborator_url  = collab_url,
+                memory_context    = mem_ctx,
             )
 
             self._log("Calling {0} API for {1}...".format(provider, url))
@@ -356,6 +401,31 @@ class Scanner(object):
                         before, len(issues), url))
             except Exception as ve:
                 self._log("Self-verify skipped (error): {0}".format(str(ve)))
+
+            # Cross-scan memory: drop findings already dismissed as false positive
+            # on this host, and remember high-confidence ones as confirmed.
+            if use_mem and issues:
+                kept = []
+                for iss in issues:
+                    try:
+                        nm = iss.getIssueName()
+                        try:
+                            conf = iss.getConfidence()
+                        except Exception:
+                            conf = ""
+                        proven = conf in ("Certain", "Firm")
+                        # Drop a known FP only when it's still UNPROVEN here. If the
+                        # AI now has concrete proof (Certain/Firm), keep it -- the
+                        # response genuinely shows it this time.
+                        if self.memory.is_fp(host, nm) and not proven:
+                            self._log("Memory: skipped known false positive '{0}' on {1}".format(nm, host))
+                            continue
+                        kept.append(iss)
+                        if proven:
+                            self.memory.add_confirmed(host, path, nm, iss.getSeverity())
+                    except Exception:
+                        kept.append(iss)
+                issues = kept
 
             for issue in issues:
                 try:

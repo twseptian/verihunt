@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AgenticBurp - AI-Powered Security Analysis for Burp Suite
+# VeriHunt - AI-Powered Security Analysis for Burp Suite
 # api_client.py — Multi-provider LLM client
 # Providers: Anthropic (Claude), OpenAI, OpenRouter, Ollama, Gemini,
 #            DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI (Grok)
@@ -8,10 +8,93 @@
 import json
 import re
 import time
+import threading
 
 # Use Java's networking stack for robust HTTPS/SSL support in Jython
 from java.net import URL
 from java.io import BufferedReader, InputStreamReader
+
+
+# ── Session token usage tracker ───────────────────────────────────────────────
+# Accumulates token usage across every analysis call so the UI can show a live
+# "tokens this session" figure (handy for TPM-limited free tiers like Groq and
+# for paid-quota budgeting). Module-level + locked so any APIClient instance and
+# the UI thread share one running total safely.
+_USAGE_LOCK = threading.Lock()
+_USAGE = {"calls": 0, "prompt": 0, "completion": 0, "total": 0,
+          "last_prompt": 0, "last_completion": 0, "last_total": 0}
+
+
+def record_usage(prompt_tokens, completion_tokens, total_tokens=None):
+    """Add one call's token usage to the running session total. Silently ignores
+    missing/unparseable values so a provider that omits usage never breaks a scan."""
+    try:
+        p = int(prompt_tokens or 0)
+        c = int(completion_tokens or 0)
+        t = int(total_tokens) if total_tokens else (p + c)
+    except (ValueError, TypeError):
+        return
+    if p == 0 and c == 0 and t == 0:
+        return
+    with _USAGE_LOCK:
+        _USAGE["calls"] += 1
+        _USAGE["prompt"] += p
+        _USAGE["completion"] += c
+        _USAGE["total"] += t
+        _USAGE["last_prompt"] = p
+        _USAGE["last_completion"] = c
+        _USAGE["last_total"] = t
+
+
+def get_usage():
+    with _USAGE_LOCK:
+        return dict(_USAGE)
+
+
+def reset_usage():
+    with _USAGE_LOCK:
+        for k in list(_USAGE.keys()):
+            _USAGE[k] = 0
+
+
+def _usage_openai(result):
+    u = result.get("usage") or {}
+    return (u.get("prompt_tokens"), u.get("completion_tokens"), u.get("total_tokens"))
+
+
+def _usage_anthropic(result):
+    u = result.get("usage") or {}
+    return (u.get("input_tokens"), u.get("output_tokens"), None)
+
+
+def _usage_gemini(result):
+    u = result.get("usageMetadata") or {}
+    return (u.get("promptTokenCount"), u.get("candidatesTokenCount"), u.get("totalTokenCount"))
+
+
+def _oai_content_or_diag(provider_label, choices):
+    """Return the assistant message content, or an INFORMATIVE diagnostic when it
+    is empty. Reasoning models (e.g. deepseek-reasoner, 'thinking' variants) put
+    text in `reasoning_content` and can return an empty `content` -- especially
+    when finish_reason == 'length' (Max Tokens exhausted during reasoning). Never
+    return an empty string, so the caller never silently shows 0 findings."""
+    msg = (choices[0].get("message") or {}) if choices else {}
+    content = msg.get("content")
+    if content and content.strip():
+        return content
+    # Reasoning models: fall back to the reasoning text so it can still be parsed.
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+    if reasoning and reasoning.strip():
+        return reasoning
+    finish = (choices[0].get("finish_reason") if choices else u"") or u"unknown"
+    return (u"[{0}] The model returned an EMPTY completion (finish_reason={1}).\n\n"
+            u"Likely causes:\n"
+            u"- A reasoning model spent all output tokens 'thinking' -> raise **Max "
+            u"Tokens** in Settings (try 8192+), or pick a non-reasoning model.\n"
+            u"- An invalid model id (e.g. 'deepseek-flash' is not a DeepSeek model -- "
+            u"use **deepseek-chat** or **deepseek-reasoner**).\n"
+            u"- The endpoint returned only reasoning with no final answer.").format(
+                provider_label, finish)
 
 
 # ── OpenAI-compatible providers ─────────────────────────────────────────────────
@@ -28,23 +111,39 @@ from java.io import BufferedReader, InputStreamReader
 OAI_COMPAT_PROVIDERS = [
     ("DeepSeek", "https://api.deepseek.com", "deepseek-chat",
      "platform.deepseek.com",
-     "deepseek-chat (V3, general)  |  deepseek-reasoner (R1, chain-of-thought)"),
-    ("Kimi (Moonshot)", "https://api.moonshot.ai/v1", "moonshot-v1-8k",
+     "deepseek-chat (V-series, general)  |  deepseek-reasoner (reasoning / chain-of-thought)"),
+    ("Kimi (Moonshot)", "https://api.moonshot.ai/v1", "kimi-latest",
      "platform.moonshot.ai",
-     "moonshot-v1-8k / -32k / -128k  |  kimi-k2-0711-preview  (see platform.moonshot.ai/console)"),
+     "kimi-latest  |  kimi-k2-0905-preview  |  moonshot-v1-8k / -32k / -128k"),
     ("Mistral", "https://api.mistral.ai/v1", "mistral-large-latest",
      "console.mistral.ai",
-     "mistral-large-latest  |  mistral-small-latest  |  codestral-latest"),
+     "mistral-large-latest  |  mistral-medium-latest  |  mistral-small-latest  |  codestral-latest"),
     ("Groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile",
      "console.groq.com/keys",
-     "llama-3.3-70b-versatile  |  llama-3.1-8b-instant  |  (very fast inference)"),
-    ("xAI (Grok)", "https://api.x.ai/v1", "grok-2-latest",
+     "llama-3.3-70b-versatile  |  llama-3.1-8b-instant  |  openai/gpt-oss-120b  |  moonshotai/kimi-k2-instruct"),
+    ("xAI (Grok)", "https://api.x.ai/v1", "grok-4.6",
      "console.x.ai",
-     "grok-2-latest  |  grok-2-vision-latest  |  grok-beta"),
+     "grok-4.6  |  grok-4.5  |  grok-4.3  (see console.x.ai/models)"),
     # OpenCode Zen — a hosted model gateway. OpenAI-compatible at /zen/v1.
-    ("OpenCode Zen", "https://opencode.ai/zen/v1", "claude-sonnet-4-5",
+    ("OpenCode Zen", "https://opencode.ai/zen/v1", "claude-sonnet-5",
      "opencode.ai/zen",
-     "Pick a model from opencode.ai/zen (e.g. claude-sonnet-4-5, gpt-5-codex, kimi-k2)"),
+     "Pick a model from opencode.ai/zen (e.g. claude-sonnet-5, gpt-5.1, kimi-k3)"),
+    # Z.AI — Zhipu's international platform; OpenAI-compatible at /api/paas/v4.
+    # Standard pay-as-you-go API keys live here. GLM Coding Plan keys are ONLY
+    # valid on the coding endpoint -> dedicated "Z.AI Coding Plan (GLM)" entry.
+    ("Z.AI (GLM)", "https://api.z.ai/api/paas/v4", "glm-4.6",
+     "z.ai",
+     "Standard (pay-as-you-go) API key. glm-4.6 (flagship, 200k ctx)  |  glm-4.5  |  glm-4.5-air  |  glm-4.5-flash (free)"),
+    # GLM Coding Plan: key is bound to the coding endpoint; standard /api/paas/v4
+    # rejects it. Same models; separate settings key so both keys coexist.
+    ("Z.AI Coding Plan (GLM)", "https://api.z.ai/api/coding/paas/v4", "glm-4.6",
+     "z.ai (Coding Plan)",
+     "GLM Coding Plan key ONLY (Personal/Pro plan). glm-4.6  |  glm-4.5  |  glm-4.5-air"),
+    # Custom — any internal/OpenAI-compatible gateway (LiteLLM, Azure OpenAI-
+    # compatible surface, private proxy). Base URL must be filled in by the user.
+    ("Custom (OpenAI-compatible)", "", "", "your LLM gateway",
+     "Enterprise gateway (LiteLLM, Azure OpenAI-compatible, private proxy). "
+     "Set Base URL + Model, then Test Connection."),
 ]
 
 # label -> (base_url, default_model) for O(1) dispatch lookup
@@ -59,6 +158,9 @@ OAI_COMPAT_KEYS = {
     "Groq":            "groq",
     "xAI (Grok)":      "xai",
     "OpenCode Zen":    "opencode",
+    "Z.AI (GLM)":      "zai",
+    "Z.AI Coding Plan (GLM)": "zaicoding",
+    "Custom (OpenAI-compatible)": "custom",
 }
 
 
@@ -88,15 +190,17 @@ def _oai_error_message(body):
 
 
 def _chat_completions_url(base_url):
-    """Build the chat/completions URL from a base, tolerating an optional /v1.
+    """Build the chat/completions URL from a base, version-segment aware.
 
-    Some vendors publish their base WITH the version segment (Moonshot:
-    https://api.moonshot.ai/v1) and some WITHOUT (DeepSeek:
-    https://api.deepseek.com). Normalise so we never emit /v1/v1/chat/completions
-    or a bare /chat/completions against a versionless host.
+    Some vendors publish their base WITH a version segment (Moonshot
+    https://api.moonshot.ai/v1, Z.AI https://api.z.ai/api/paas/v4, OpenCode Zen
+    https://opencode.ai/zen/v1) and some WITHOUT (DeepSeek
+    https://api.deepseek.com). If the root already ends in /v<N>, only
+    /chat/completions is appended; otherwise /v1/chat/completions. Never emits
+    /v1/v1/... or a bare /chat/completions against a versionless host.
     """
     root = (base_url or "").rstrip("/")
-    if root.endswith("/v1"):
+    if re.search(r"/v\d+$", root):
         return root + "/chat/completions"
     return root + "/v1/chat/completions"
 
@@ -263,6 +367,7 @@ class APIClient(object):
             if status != 200:
                 return "[Anthropic Error {0}] {1}".format(status, body[:500])
             result = json.loads(body)
+            record_usage(*_usage_anthropic(result))
             content = result.get("content") or []
             texts = [c.get("text", "") for c in content if c.get("type") == "text"]
             return "\n".join(texts) or "[Anthropic] Empty response."
@@ -296,7 +401,8 @@ class APIClient(object):
             choices = result.get("choices") or []
             if not choices:
                 return "[OpenAI] No choices in response."
-            return (choices[0].get("message") or {}).get("content") or ""
+            record_usage(*_usage_openai(result))
+            return _oai_content_or_diag("OpenAI", choices)
         except Exception as e:
             return "[OpenAI Exception] {0}".format(str(e))
 
@@ -359,11 +465,14 @@ class APIClient(object):
                     detail = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                     return "[{0} Error] {1}".format(provider_label, detail[:400])
                 return "[{0}] No choices in response.".format(provider_label)
-            return (choices[0].get("message") or {}).get("content") or ""
+            record_usage(*_usage_openai(result))
+            return _oai_content_or_diag(provider_label, choices)
         except Exception as e:
             return "[{0} Exception] {1}".format(provider_label, str(e))
 
     def test_openai_compatible(self, provider_label, base_url, api_key, model):
+        if not (base_url or "").strip():
+            return False, "No Base URL set"
         if not api_key:
             return False, "No API key"
         url = _chat_completions_url(base_url)
@@ -393,7 +502,7 @@ class APIClient(object):
     # ── OpenRouter ─────────────────────────────────────────────────────────────
 
     def call_openrouter(self, api_key, model, system_prompt, user_prompt, max_tokens,
-                        site_url="https://burp.local", site_name="AgenticBurp"):
+                        site_url="https://burp.local", site_name="VeriHunt"):
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -469,7 +578,8 @@ class APIClient(object):
             choices = result.get("choices") or []
             if not choices:
                 return "[OpenRouter] No choices in response."
-            return (choices[0].get("message") or {}).get("content") or ""
+            record_usage(*_usage_openai(result))
+            return _oai_content_or_diag("OpenRouter", choices)
         except Exception as e:
             return "[OpenRouter Exception] {0}".format(str(e))
 
@@ -506,7 +616,8 @@ class APIClient(object):
             choices = result.get("choices") or []
             if not choices:
                 return "[Ollama] No choices in response."
-            return (choices[0].get("message") or {}).get("content") or ""
+            record_usage(*_usage_openai(result))
+            return _oai_content_or_diag("Ollama", choices)
         except Exception as e:
             return "[Ollama Exception] {0}".format(str(e))
 
@@ -540,6 +651,7 @@ class APIClient(object):
             candidates = result.get("candidates") or []
             if not candidates:
                 return "[Gemini] No candidates returned."
+            record_usage(*_usage_gemini(result))
             parts = (candidates[0].get("content") or {}).get("parts") or []
             texts = [p.get("text", "") for p in parts if "text" in p]
             return "\n".join(texts) or "[Gemini] Empty response."
@@ -599,7 +711,7 @@ class APIClient(object):
             "Content-Type": "application/json",
             "Authorization": "Bearer {0}".format(api_key),
             "HTTP-Referer": "https://burp.local",
-            "X-Title": "AgenticBurp",
+            "X-Title": "VeriHunt",
         }
         payload = {"model": model, "max_tokens": 1,
                    "messages": [{"role": "user", "content": "Hi"}]}
@@ -693,7 +805,7 @@ class APIClient(object):
         if provider == "Anthropic":
             return self.call_anthropic(
                 api_key=settings.get("anthropic_key", ""),
-                model=settings.get("anthropic_model", "claude-sonnet-4-6"),
+                model=settings.get("anthropic_model", "claude-sonnet-5"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -701,7 +813,7 @@ class APIClient(object):
         elif provider == "OpenAI":
             return self.call_openai(
                 api_key=settings.get("openai_key", ""),
-                model=settings.get("openai_model", "gpt-4o"),
+                model=settings.get("openai_model", "gpt-5.1"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -709,7 +821,7 @@ class APIClient(object):
         elif provider == "OpenRouter":
             return self.call_openrouter(
                 api_key=settings.get("openrouter_key", ""),
-                model=settings.get("openrouter_model", "anthropic/claude-sonnet-4-6"),
+                model=settings.get("openrouter_model", "anthropic/claude-sonnet-5"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -717,7 +829,7 @@ class APIClient(object):
         elif provider == "Gemini":
             return self.call_gemini(
                 api_key=settings.get("gemini_key", ""),
-                model=settings.get("gemini_model", "gemini-2.0-flash"),
+                model=settings.get("gemini_model", "gemini-2.5-flash"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -741,12 +853,17 @@ class APIClient(object):
                 api_key=key,
             )
         elif provider in OAI_COMPAT_MAP:
-            # DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI — all one code path.
+            # DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI, Z.AI, Custom — one path.
             base_default, model_default = OAI_COMPAT_MAP[provider]
             key = _settings_key(provider)
+            base = settings.get(key + "_base", base_default) or base_default
+            if not base:
+                return ("[{0}] No Base URL set. Open Settings > {0} and enter your "
+                        "gateway URL (e.g. http://litellm.internal:4000/v1), then "
+                        "Test Connection.").format(provider)
             return self.call_openai_compatible(
                 provider_label=provider,
-                base_url=settings.get(key + "_base", base_default),
+                base_url=base,
                 api_key=settings.get(key + "_key", ""),
                 model=settings.get(key + "_model", model_default),
                 system_prompt=system_prompt,

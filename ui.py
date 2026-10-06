@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AgenticBurp - ui.py
+# VeriHunt - ui.py
 
 import base64
 import json
@@ -9,8 +9,10 @@ from javax.swing import (
     JPanel, JLabel, JTextField, JPasswordField, JComboBox, JCheckBox, JTextArea,
     JScrollPane, JButton, JSplitPane, JList, DefaultListModel, JEditorPane,
     JTabbedPane, BorderFactory, JMenuItem, JPopupMenu, JFileChooser, Timer,
-    DefaultListCellRenderer, BoxLayout, SwingUtilities,
+    DefaultListCellRenderer, BoxLayout, SwingUtilities, JTable, ListSelectionModel,
+    Scrollable,
 )
+from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 from javax.swing.text.html import HTMLEditorKit, StyleSheet
 from java.awt import BorderLayout, FlowLayout, GridLayout, Color, Font, Dimension
 from java.awt.event import (
@@ -18,14 +20,25 @@ from java.awt.event import (
     KeyAdapter as _KeyAdapter, KeyEvent as _KeyEvent,
 )
 from javax.swing.event import DocumentListener as _DocumentListener
+from javax.swing.event import ListSelectionListener as _ListSelectionListener
+from javax.swing.event import ChangeListener as _ChangeListener
 from java.lang import Thread as _JThread, Runnable as _JRunnable
 
 from burp import IMessageEditorController
 
 from prompt_handler import DEFAULT_USER_PROMPT_TEMPLATE, SYSTEM_PROMPT
 from report_generator import _md_to_html as _md2html
+from report_generator import (
+    build_markdown_report as _build_md_report,
+    build_html_report as _build_html_report,
+    finding_record_to_markdown as _finding_to_md,
+    AgenticBurpIssue as _AgenticBurpIssue,
+)
+import demo_data as _demo
 from api_client import APIClient as _APIClient
 from api_client import OAI_COMPAT_PROVIDERS, OAI_COMPAT_KEYS
+from api_client import get_usage as _get_usage, reset_usage as _reset_usage
+import hunt_engine as _hunt
 from javax.swing import UIManager
 
 
@@ -149,12 +162,45 @@ def _norm_finding_name(name):
     return n
 
 
+def _norm_finding_url(url):
+    """Normalize a finding URL for cross-analysis dedup: drop query/fragment and any
+    trailing slash, lowercase. Two analyses of the SAME endpoint (differing only by
+    query values) collapse to one key, while different paths stay distinct."""
+    try:
+        s = str(url or u"").strip()
+    except Exception:
+        return u""
+    if not s:
+        return u""
+    s = s.split(u"#", 1)[0].split(u"?", 1)[0].lower()
+    if len(s) > 1 and s.endswith(u"/"):
+        s = s[:-1]
+    return s
+
+
+def _names_dup(a, b):
+    """True if two finding names denote the same issue: equal after normalization, or
+    one's significant tokens are a subset of the other's (catches the model naming the
+    same issue slightly differently across runs, e.g. 'Credentialed Wildcard' vs
+    'Credentialed Wildcard Origin')."""
+    na, nb = _norm_finding_name(a), _norm_finding_name(b)
+    if not na or not nb:
+        return na == nb
+    if na == nb:
+        return True
+    ta = set(t for t in na.split() if len(t) > 2)
+    tb = set(t for t in nb.split() if len(t) > 2)
+    if ta and tb and (ta <= tb or tb <= ta):
+        return True
+    return False
+
+
 # Generic fallback strings report_generator injects when the model provided no
 # dedicated Background/Remediation section. Suppressed in the Advisory so they do
 # not sit next to real, detailed content and read as unfinished. Keep in sync with
 # report_generator.py's fallbacks.
 _GENERIC_ADVISORY_FILLER = frozenset([
-    u"Identified by AgenticBurp AI analysis.",
+    u"Identified by VeriHunt AI analysis.",
     u"Review and remediate the identified vulnerability.",
     u"Review the AI analysis and perform manual verification.",
 ])
@@ -208,6 +254,45 @@ def _apply_html_theme(pane, is_chat=False):
     pane.setContentType("text/html")
     pane.setEditorKit(kit)
     pane.setBackground(th.card_bg)
+
+
+# ── Theme-aware button palettes ───────────────────────────────────────────────
+# Solid-fill buttons keyed by semantic role. In dark mode the fills are lightened
+# a step so they stand out against Burp's dark panels (a #37474F fill on a #2b2b2b
+# panel is nearly invisible); in light mode the original saturated colours are kept.
+# White text reads on every fill in both themes.
+_BTN_FILL_LIGHT = {
+    "primary":   0xFF6B35,  # orange  — Save Settings / Export / Send
+    "secondary": 0x546E7A,  # slate   — Reset Prompt / Clear
+    "neutral":   0x37474F,  # dk slate — Show All
+    "danger":    0xC62828,  # red     — Stop
+    "purple":    0x6A1B9A,  # purple  — Toggle False Positive
+}
+_BTN_FILL_DARK = {
+    "primary":   0xFF7A45,
+    "secondary": 0x607D8B,
+    "neutral":   0x546E7A,
+    "danger":    0xE53935,
+    "purple":    0x9C4DCC,
+}
+
+
+def _btn_colors(role):
+    """Return (bg, fg) Colors for a solid-fill button role in the active theme."""
+    th = _theme()
+    table = _BTN_FILL_DARK if th.dark else _BTN_FILL_LIGHT
+    bg = table.get(role, table["secondary"])
+    return Color(bg), Color(0xFFFFFF)
+
+
+def _link_color(kind):
+    """Foreground for a text-only (borderless) button. Dark mode uses brighter
+    tints so 'Clear'/'Test Connection' don't disappear on dark button chrome."""
+    th = _theme()
+    if kind == "danger":
+        return Color(0xEF5350) if th.dark else Color(0xC62828)
+    # accent (links, Test Connection)
+    return Color(0x64B5F6) if th.dark else Color(0x1565C0)
 
 
 # Provider-specific safe Max Tokens defaults, applied when the user switches the
@@ -287,7 +372,7 @@ class UI(object):
         safe = _PROVIDER_SAFE_MAX_TOKENS.get(prov)
         if safe is not None:
             self._max_tokens.setText(str(safe))
-            self._log("{0} selected — Max Tokens set to {1} to stay under the "
+            self._log("{0} selected -- Max Tokens set to {1} to stay under the "
                       "tokens-per-minute limit (avoids 429). Adjust if needed.".format(prov, safe))
 
     def _log(self, msg):
@@ -324,10 +409,11 @@ class UI(object):
         self._save_str("ollama_url",      self._ollama_url.getText())
         self._save_str("ollama_key",      _obfuscate(self._ollama_key.getText()))
         self._save_str("ollama_model",    self._ollama_model.getText())
-        # OpenAI-compatible providers (DeepSeek, Kimi, Mistral, Groq, xAI)
-        for key_prefix, (key_f, model_f, _s) in self._oai_fields.items():
+        # OpenAI-compatible providers (DeepSeek, Kimi, Mistral, Groq, xAI, ...)
+        for key_prefix, (key_f, model_f, _s, base_f) in self._oai_fields.items():
             self._save_str(key_prefix + "_key",   _obfuscate(key_f.getText()))
             self._save_str(key_prefix + "_model", model_f.getText())
+            self._save_str(key_prefix + "_base",  base_f.getText())
         self._save_str("max_tokens",      self._max_tokens.getText())
         self._save_str("max_concurrent",  self._max_concurrent.getText())
         self._save_str("scope_only",      str(self._scope_only_chk.isSelected()))
@@ -343,22 +429,25 @@ class UI(object):
             self._provider_combo.setSelectedItem(self._load_str("provider", "Anthropic"))
             # API keys loaded and de-obfuscated
             self._ant_key.setText(_deobfuscate(self._load_str("anthropic_key", "")))
-            self._ant_model.setSelectedItem(self._load_str("anthropic_model", "claude-sonnet-4-6"))
+            self._ant_model.setSelectedItem(self._load_str("anthropic_model", "claude-sonnet-5"))
             self._oai_key.setText(_deobfuscate(self._load_str("openai_key", "")))
-            self._oai_model.setSelectedItem(self._load_str("openai_model", "gpt-4o"))
+            self._oai_model.setSelectedItem(self._load_str("openai_model", "gpt-5.1"))
             self._or_key.setText(_deobfuscate(self._load_str("or_key", "")))
-            self._or_model.setText(self._load_str("or_model", "anthropic/claude-sonnet-4-6"))
+            self._or_model.setText(self._load_str("or_model", "anthropic/claude-sonnet-5"))
             self._gem_key.setText(_deobfuscate(self._load_str("gemini_key", "")))
-            self._gem_model.setSelectedItem(self._load_str("gemini_model", "gemini-2.0-flash"))
+            self._gem_model.setSelectedItem(self._load_str("gemini_model", "gemini-2.5-flash"))
             self._ollama_mode.setSelectedItem(self._load_str("ollama_mode", "Local server"))
             self._ollama_url.setText(self._load_str("ollama_url", "http://localhost:11434"))
             self._ollama_key.setText(_deobfuscate(self._load_str("ollama_key", "")))
             self._ollama_model.setText(self._load_str("ollama_model", "qwen2.5-coder:7b"))
-            for key_prefix, (key_f, model_f, _s) in self._oai_fields.items():
+            for key_prefix, (key_f, model_f, _s, base_f) in self._oai_fields.items():
                 key_f.setText(_deobfuscate(self._load_str(key_prefix + "_key", "")))
                 saved_model = self._load_str(key_prefix + "_model", "")
                 if saved_model:
                     model_f.setText(saved_model)
+                saved_base = self._load_str(key_prefix + "_base", "")
+                if saved_base:
+                    base_f.setText(saved_base)
             self._max_tokens.setText(self._load_str("max_tokens", "2048"))
             self._max_concurrent.setText(self._load_str("max_concurrent", "2"))
             self._scope_only_chk.setSelected(
@@ -382,7 +471,19 @@ class UI(object):
         self._tabs.setFont(Font("SansSerif", Font.BOLD, 12))
         self._tabs.addTab("  Settings  ", self._build_settings())
         self._tabs.addTab("  Results   ", self._build_results())
+        self._tabs.addTab("  AI Hunt   ", self._build_hunt())
+        self._tabs.addTab("  Dashboard ", self._build_dashboard())
         self._tabs.addTab("  About     ", self._build_about())
+        # Refresh the dashboard whenever it becomes the selected tab.
+        class _TabChange(_ChangeListener):
+            def __init__(s, ui): s._ui = ui
+            def stateChanged(s, e):
+                try:
+                    if s._ui._tabs.getSelectedComponent() is s._ui._dash_panel:
+                        s._ui._refresh_dashboard()
+                except Exception:
+                    pass
+        self._tabs.addChangeListener(_TabChange(self))
         main.add(self._tabs, BorderLayout.CENTER)
         self._panel = main
 
@@ -402,7 +503,7 @@ class UI(object):
 
         left = JPanel(GridLayout(2, 1, 0, 1))
 
-        title = JLabel("AgenticBurp")
+        title = JLabel("VeriHunt")
         title.setFont(Font("SansSerif", Font.BOLD, 18))
         title.setForeground(_ORANGE)
 
@@ -414,7 +515,7 @@ class UI(object):
         left.add(sub)
         banner.add(left, BorderLayout.WEST)
 
-        badge = JLabel("Agentic Pentest")
+        badge = JLabel("Evidence-Grounded")
         badge.setFont(Font("SansSerif", Font.BOLD, 10))
         badge.setForeground(_ORANGE)
         badge.setBorder(BorderFactory.createCompoundBorder(
@@ -466,9 +567,18 @@ class UI(object):
         self._self_verify_chk.setToolTipText(
             "Run a second AI pass that checks each finding against the actual HTTP "
             "response: unproven findings are downgraded to 'Potential' and refuted "
-            "ones dropped. Reduces false positives — costs one extra API call per "
+            "ones dropped. Reduces false positives -- costs one extra API call per "
             "analysis.")
         top.add(self._self_verify_chk)
+        self._memory_chk = JCheckBox("Memory", True)
+        self._memory_chk.setToolTipText(
+            "Cross-scan memory: remembers false positives + confirmed findings per "
+            "host and feeds them to the AI so it skips known FPs on later scans. "
+            "Toggle False Positive updates it. Persists across restarts.")
+        top.add(self._memory_chk)
+        clear_mem = self._skin_btn(JButton("Clear Memory"), "secondary")
+        clear_mem.addActionListener(lambda e: self._clear_memory())
+        top.add(clear_mem)
         top.add(JLabel("Theme:"))
         self._theme_combo = JComboBox(["Auto", "Light", "Dark"])
         self._theme_combo.setToolTipText(
@@ -476,10 +586,10 @@ class UI(object):
             "it if auto-detection guesses wrong. Applies immediately.")
         self._theme_combo.addActionListener(lambda e: self._apply_theme_now())
         top.add(self._theme_combo)
-        save_btn = self._style_btn(JButton("Save Settings"), Color(0xFF6B35), Color.WHITE)
+        save_btn = self._skin_btn(JButton("Save Settings"), "primary")
         save_btn.addActionListener(lambda e: self._save_settings())
         top.add(save_btn)
-        reset_btn = self._style_btn(JButton("Reset Prompt"), Color(0x546E7A), Color.WHITE)
+        reset_btn = self._skin_btn(JButton("Reset Prompt"), "secondary")
         reset_btn.addActionListener(lambda e: self._prompt_area.setText(DEFAULT_USER_PROMPT_TEMPLATE))
         top.add(reset_btn)
         outer.add(top, BorderLayout.NORTH)
@@ -494,7 +604,7 @@ class UI(object):
         # DeepSeek, Kimi (Moonshot), Mistral, Groq, xAI — all OpenAI-compatible,
         # one builder driven by the registry. Fields are stored on self by key
         # prefix so save/load and get_provider_settings can find them generically.
-        self._oai_fields = {}   # key_prefix -> (key_field, model_field, status_lbl)
+        self._oai_fields = {}   # key_prefix -> (key_field, model_field, status_lbl, base_field)
         for (label, base, default_model, key_url, model_hint) in OAI_COMPAT_PROVIDERS:
             cred_tabs.addTab(label, self._build_oai_compat(
                 label, base, default_model, key_url, model_hint))
@@ -558,7 +668,7 @@ class UI(object):
         """Return a small 'Clear' button that wipes a JPasswordField and its stored preference."""
         btn = JButton("Clear")
         btn.setFont(btn.getFont().deriveFont(Font.PLAIN, 11.0))
-        btn.setForeground(Color(0xC62828))
+        self._skin_link_btn(btn, "danger")
         btn.setToolTipText("Clear saved API key")
         ui_ref = self
         class _ClearAction(_ActionListener):
@@ -579,7 +689,7 @@ class UI(object):
         """Return a 'Test' button that runs test_fn() in a background thread."""
         btn = JButton("Test Connection")
         btn.setFont(btn.getFont().deriveFont(Font.PLAIN, 11.0))
-        btn.setForeground(Color(0x1565C0))
+        self._skin_link_btn(btn, "accent")
         btn.setToolTipText("Test API connectivity with current credentials")
 
         class _TestAction(_ActionListener):
@@ -618,10 +728,11 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._ant_key   = JPasswordField(40)
-        self._ant_model = JComboBox(["claude-sonnet-4-6", "claude-opus-4-6",
+        self._ant_model = JComboBox(["claude-sonnet-5", "claude-opus-5",
                                      "claude-haiku-4-5-20251001",
-                                     "claude-3-5-sonnet-20241022",
-                                     "claude-3-5-haiku-20241022"])
+                                     "claude-fable-5-1",
+                                     "claude-opus-4-8"])
+        self._ant_model.setEditable(True)   # let users type any newer/other model id
         self._ant_status = self._conn_status_lbl()
         _client = self._api_client
         _key_f  = self._ant_key
@@ -640,8 +751,9 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._oai_key   = JPasswordField(40)
-        self._oai_model = JComboBox(["gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
-                                     "gpt-4", "gpt-3.5-turbo", "o1", "o1-mini", "o3-mini"])
+        self._oai_model = JComboBox(["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+                                     "gpt-4.1", "gpt-4o", "o3", "o4-mini"])
+        self._oai_model.setEditable(True)   # let users type any newer/other model id
         self._oai_status = self._conn_status_lbl()
         _client = self._api_client
         _key_f  = self._oai_key
@@ -660,7 +772,7 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._or_key   = JPasswordField(40)
-        self._or_model = JTextField("meta-llama/llama-3.3-70b-instruct:free", 40)
+        self._or_model = JTextField("anthropic/claude-sonnet-5", 40)
         self._or_status = self._conn_status_lbl()
         _client = self._api_client
         _key_f  = self._or_key
@@ -671,11 +783,11 @@ class UI(object):
         rows.add(self._row_panel(JLabel("Model ID: "), self._or_model))
         rows.add(self._row_panel(self._test_conn_btn(self._or_status, _or_test), self._or_status))
 
-        fast_lbl = JLabel(u"Free: meta-llama/llama-3.3-70b-instruct:free  \u2022  google/gemma-3-27b-it:free  \u2022  deepseek/deepseek-r1:free")
+        fast_lbl = JLabel(u"Free: append ':free' to many models, e.g. meta-llama/llama-3.3-70b-instruct:free  \u2022  see openrouter.ai/models")
         fast_lbl.setFont(fast_lbl.getFont().deriveFont(Font.PLAIN, 11.0))
         rows.add(fast_lbl)
 
-        paid_lbl = JLabel(u"Paid: anthropic/claude-sonnet-4-6  \u2022  openai/gpt-4o  \u2022  google/gemini-2.5-pro")
+        paid_lbl = JLabel(u"Paid: anthropic/claude-sonnet-5  \u2022  openai/gpt-5.1  \u2022  google/gemini-2.5-pro  \u2022  x-ai/grok-4.6")
         paid_lbl.setFont(paid_lbl.getFont().deriveFont(Font.PLAIN, 11.0))
         rows.add(paid_lbl)
 
@@ -692,12 +804,12 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._gem_key   = JPasswordField(40)
-        self._gem_model = JComboBox(["gemini-2.0-flash",
-                                     "gemini-2.0-flash-lite",
+        self._gem_model = JComboBox(["gemini-2.5-flash",
                                      "gemini-2.5-pro",
-                                     "gemini-1.5-pro",
-                                     "gemini-1.5-flash",
-                                     "gemini-1.5-flash-8b"])
+                                     "gemini-2.5-flash-lite",
+                                     "gemini-3-flash-preview",
+                                     "gemini-3.1-pro-preview"])
+        self._gem_model.setEditable(True)   # let users type any newer/other model id
         self._gem_status = self._conn_status_lbl()
         _client = self._api_client
         _key_f  = self._gem_key
@@ -714,9 +826,10 @@ class UI(object):
     def _build_oai_compat(self, label, base_url, default_model, key_url, model_hint):
         """Generic credential panel for an OpenAI-compatible provider.
 
-        DeepSeek / Kimi / Mistral / Groq / xAI differ only in base URL, default
-        model and sign-up link, so they share this one builder instead of five
-        near-identical methods.
+        DeepSeek / Kimi / Mistral / Groq / xAI / Z.AI differ only in base URL,
+        default model and sign-up link, so they share this one builder. The Base
+        URL is editable so enterprise users can point a provider (or the Custom
+        entry) at an internal gateway (LiteLLM, Azure OpenAI-compatible, proxy).
         """
         key_prefix = OAI_COMPAT_KEYS.get(label, label.lower())
         p = JPanel(BorderLayout(4, 2))
@@ -725,8 +838,9 @@ class UI(object):
 
         key_field   = JPasswordField(40)
         model_field = JTextField(default_model, 40)
+        base_field  = JTextField(base_url, 40)
         status_lbl  = self._conn_status_lbl()
-        self._oai_fields[key_prefix] = (key_field, model_field, status_lbl)
+        self._oai_fields[key_prefix] = (key_field, model_field, status_lbl, base_field)
 
         _client = self._api_client
         _label  = label
@@ -734,19 +848,26 @@ class UI(object):
 
         def _test():
             return _client.test_openai_compatible(
-                _label, _base, key_field.getText(), model_field.getText())
+                _label, base_field.getText().strip() or _base,
+                key_field.getText(), model_field.getText())
 
         rows.add(self._row_panel(JLabel("API Key:  "), key_field,
                                  self._clear_key_btn(key_field, key_prefix + "_key")))
         rows.add(self._row_panel(JLabel("Model ID: "), model_field))
+        rows.add(self._row_panel(JLabel("Base URL: "), base_field))
         rows.add(self._row_panel(self._test_conn_btn(status_lbl, _test), status_lbl))
 
         hint = JLabel("Models: " + model_hint)
         hint.setFont(hint.getFont().deriveFont(Font.PLAIN, 11.0))
         rows.add(hint)
-        rows.add(JLabel("Endpoint: {0}   |   Get key: {1}".format(base_url, key_url)))
+        ep = "Endpoint (default): {0}".format(base_url) if base_url else \
+             "No default endpoint - enter your gateway's Base URL above."
+        if key_url:
+            ep += "   |   Get key: {0}".format(key_url)
+        rows.add(JLabel(ep))
 
-        note = JLabel("OpenAI-compatible provider. Set Max Tokens per the model's limit.")
+        note = JLabel("OpenAI-compatible. Base URL is editable (internal gateways); "
+                      "set Max Tokens per the model's limit.")
         note.setFont(note.getFont().deriveFont(Font.ITALIC, 11.0))
         note.setForeground(Color(0x666666))
         rows.add(note)
@@ -827,21 +948,46 @@ class UI(object):
         # Active provider + model, so it's obvious which AI produced the findings.
         self._model_lbl = JLabel("")
         self._model_lbl.setForeground(Color(0xFF6B35))
+        # Session token usage — running total across all analyses this session
+        # (last call + cumulative), for TPM/quota awareness.
+        self._token_lbl = JLabel("")
+        self._token_lbl.setToolTipText(
+            "Token usage this session (from the provider's reported usage). "
+            "Resets on Clear All.")
         header.add(JLabel("Analysis Results  "))
         header.add(self._status_lbl)
         header.add(self._queue_lbl)
         header.add(self._summary_panel)
         header.add(self._model_lbl)
-        clear_btn  = self._style_btn(JButton("Clear All"),   Color(0x546E7A), Color.WHITE)
+        header.add(self._token_lbl)
+        clear_btn  = self._skin_btn(JButton("Clear All"),   "secondary")
         clear_btn.addActionListener(lambda e: self._clear())
         header.add(clear_btn)
-        self._stop_btn = self._style_btn(JButton("Stop"), Color(0xC62828), Color.WHITE)
+        demo_btn = self._skin_btn(JButton("Load Demo"), "secondary")
+        demo_btn.setToolTipText(
+            "Load sample findings + AI Hunt candidates (no API/internet) to showcase "
+            "the full workflow -- ideal for a demo.")
+        demo_btn.addActionListener(lambda e: self._load_demo())
+        header.add(demo_btn)
+        self._stop_btn = self._skin_btn(JButton("Stop"), "danger")
         self._stop_btn.setEnabled(False)
         self._stop_btn.addActionListener(lambda e: self._stop_analysis())
         header.add(self._stop_btn)
-        export_btn = self._style_btn(JButton("Export JSON"),  Color(0xFF6B35), Color.WHITE)
+        export_btn = self._skin_btn(JButton("Export JSON"),  "primary")
         export_btn.addActionListener(lambda e: self._export_json())
         header.add(export_btn)
+        # Export Report → popup with HTML / Markdown (client-ready deliverables).
+        report_btn = self._skin_btn(JButton("Export Report"), "primary")
+        report_menu = JPopupMenu()
+        _html_item = JMenuItem("HTML report...")
+        _html_item.addActionListener(lambda e: self._export_report("html"))
+        _md_item = JMenuItem("Markdown report...")
+        _md_item.addActionListener(lambda e: self._export_report("md"))
+        report_menu.add(_html_item)
+        report_menu.add(_md_item)
+        report_btn.addActionListener(
+            lambda e: report_menu.show(report_btn, 0, report_btn.getHeight()))
+        header.add(report_btn)
         # NOTE: `header` is placed into `top_panel` below (with the filter bar) and
         # top_panel goes into outer.NORTH — do NOT add `header` to outer directly
         # here or it gets reparented, leaving a redundant no-op.
@@ -871,7 +1017,7 @@ class UI(object):
 
         self._filter_field.getDocument().addDocumentListener(_FilterListener(self))
 
-        clear_filter_btn = self._style_btn(JButton("Show All"), Color(0x37474F), Color.WHITE)
+        clear_filter_btn = self._skin_btn(JButton("Show All"), "neutral")
         clear_filter_btn.addActionListener(lambda e: self._clear_filter())
         filter_bar.add(self._filter_field)
         filter_bar.add(clear_filter_btn)
@@ -928,7 +1074,7 @@ class UI(object):
         self._detail_tabs.addTab("Analyzed Request",  self._req_editor.getComponent())
         self._detail_tabs.addTab("Analyzed Response", self._resp_editor.getComponent())
 
-        fp_btn = self._style_btn(JButton("Toggle False Positive"), Color(0x6A1B9A), Color.WHITE)
+        fp_btn = self._skin_btn(JButton("Toggle False Positive"), "purple")
         fp_btn.addActionListener(lambda e: self._toggle_fp())
         detail_area = JPanel(BorderLayout())
         detail_area.add(self._detail_tabs, BorderLayout.CENTER)
@@ -1020,7 +1166,7 @@ class UI(object):
         input_scroll.setBorder(BorderFactory.createLineBorder(
             Color(0x8A8A8A) if not th.dark else Color(0x555555), 1))
 
-        self._chat_send_btn = self._style_btn(JButton("Send"), Color(0xFF6B35), Color.WHITE)
+        self._chat_send_btn = self._skin_btn(JButton("Send"), "primary")
         self._chat_send_btn.setFont(self._chat_send_btn.getFont().deriveFont(Font.BOLD))
 
         class _SendAction(_ActionListener):
@@ -1037,13 +1183,13 @@ class UI(object):
                     self._ui._chat_send()
         self._chat_input.addKeyListener(_ChatKey(self))
 
-        clear_chat = self._style_btn(JButton("Clear"), Color(0x546E7A), Color.WHITE)
+        clear_chat = self._skin_btn(JButton("Clear"), "secondary")
         class _ClearChat(_ActionListener):
             def __init__(self, ui): self._ui = ui
             def actionPerformed(self, _e): self._ui._chat_clear()
         clear_chat.addActionListener(_ClearChat(self))
 
-        hint = JLabel("Enter to send  ·  Shift+Enter for new line")
+        hint = JLabel("Enter to send  |  Shift+Enter for new line")
         hint.setForeground(th.muted)
         hint.setFont(hint.getFont().deriveFont(Font.PLAIN, 10.0))
 
@@ -1225,13 +1371,1166 @@ class UI(object):
         lines.append("Assistant:")
         return sys_p, "\n\n".join(lines)
 
+    # -- AI Hunt tab -----------------------------------------------------------
+    #
+    # HUNT-style passive parameter heuristics (hunt_engine) surfaced in a modern
+    # table, then optionally triaged by the LLM. Passive scan runs automatically
+    # on in-scope Proxy traffic (see verihunt.py IHttpListener); AI triage is
+    # on-demand to keep token usage under control.
+
+    _HUNT_COLS = ["Potential Issue", "Endpoint", "Param", "Where", "Max Severity", "Status"]
+
+    def _build_hunt(self):
+        # Never let a build error kill the tab — surface it inside the panel so the
+        # tab still opens and we can see what went wrong.
+        try:
+            return self._build_hunt_impl()
+        except Exception as ex:
+            import traceback
+            tb = ""
+            try:
+                tb = traceback.format_exc()
+            except Exception:
+                pass
+            self._log("AI Hunt build failed: " + str(ex))
+            self._log(tb)
+            p = JPanel(BorderLayout())
+            ta = JTextArea("AI Hunt failed to build:\n\n{0}\n\n{1}".format(str(ex), tb))
+            ta.setEditable(False)
+            p.add(JScrollPane(ta), BorderLayout.CENTER)
+            return p
+
+    def _build_hunt_impl(self):
+        from java.util import Vector
+        th = _theme()
+        self._helpers = self._callbacks.getHelpers()
+        self._hunt_all  = []      # every hit dict (may carry "_msg")
+        self._hunt_view = []      # hits currently shown (row-parallel)
+        self._hunt_keys = set()   # dedup by dedup_key
+        self._hunt_busy = False
+
+        outer = JPanel(BorderLayout(4, 4))
+        outer.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6))
+
+        # ── Header / controls ──
+        header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 2))
+        title = JLabel("AI Hunt")
+        title.setForeground(Color(0xFF6B35))
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 13.0))
+        header.add(title)
+
+        # Default OFF so the plugin stays light until you opt in; tick to auto-flag
+        # parameters as you browse (heuristics only — no payloads, no AI, static
+        # assets skipped, work is throttled off the proxy thread).
+        self._hunt_passive_cb = JCheckBox("Passive (Proxy)", False)
+        self._hunt_passive_cb.setToolTipText(
+            "Auto-flag suspicious parameters on Proxy traffic (heuristics only — no "
+            "payloads, no AI). Static assets are skipped and scanning runs off the "
+            "proxy thread, so it stays light.")
+        header.add(self._hunt_passive_cb)
+
+        # Retroactively scan Burp's existing Proxy history. Passive only sees traffic
+        # that arrives AFTER you tick the box, so anything browsed earlier (or with
+        # Passive off) is invisible until you press this.
+        scan_hist = self._skin_btn(JButton("Scan History"), "secondary")
+        scan_hist.setToolTipText(
+            "Run the parameter heuristics over Burp's existing Proxy history now "
+            "(retroactive). Use this if candidates are missing for a target you "
+            "already browsed -- Passive only catches NEW traffic after it's enabled.")
+        scan_hist.addActionListener(lambda e: self._hunt_scan_history())
+        header.add(scan_hist)
+
+        header.add(JLabel("Filter:"))
+        self._hunt_filter = JTextField(16)
+        class _FiltDoc(_DocumentListener):
+            def __init__(s, ui): s._ui = ui
+            def insertUpdate(s, e): s._ui._hunt_rebuild_table()
+            def removeUpdate(s, e): s._ui._hunt_rebuild_table()
+            def changedUpdate(s, e): s._ui._hunt_rebuild_table()
+        self._hunt_filter.getDocument().addDocumentListener(_FiltDoc(self))
+        header.add(self._hunt_filter)
+
+        _classes = ["All classes"] + [s["cls"] for s in _hunt.SIGNATURES]
+        try:
+            _classes.append(_hunt.GENERIC_CLASS)
+        except Exception:
+            pass
+        self._hunt_class_combo = JComboBox(_classes)
+        self._hunt_class_combo.addActionListener(lambda e: self._hunt_rebuild_table())
+        header.add(self._hunt_class_combo)
+
+        triage_sel = self._skin_btn(JButton("Triage Selected (AI)"), "primary")
+        triage_sel.addActionListener(lambda e: self._hunt_triage("selected"))
+        header.add(triage_sel)
+        triage_all = self._skin_btn(JButton("Triage All (AI)"), "secondary")
+        triage_all.addActionListener(lambda e: self._hunt_triage("all"))
+        header.add(triage_all)
+        discover_btn = self._skin_btn(JButton("AI Discover"), "primary")
+        discover_btn.setToolTipText(
+            "Ask the AI to propose issues the parameter heuristics MISS (access "
+            "control, business logic, sensitive data, headers) from the selected "
+            "candidate's endpoint. Adds rows tagged 'AI:'.")
+        discover_btn.addActionListener(lambda e: self._hunt_discover("selected"))
+        header.add(discover_btn)
+        clear_h = self._skin_btn(JButton("Clear"), "secondary")
+        clear_h.addActionListener(lambda e: self._hunt_clear())
+        header.add(clear_h)
+
+        self._hunt_count_lbl = JLabel("")
+        self._hunt_count_lbl.setForeground(th.muted)
+        header.add(self._hunt_count_lbl)
+
+        # Persistent disclaimer so candidates are never mistaken for confirmed
+        # findings -- they are heuristic guesses until validated. ASCII-only text
+        # (non-ASCII glyphs mojibake in Burp's label rendering).
+        self._hunt_banner = JLabel(
+            "  [!]  POTENTIAL candidates only -- heuristic guesses (parameter "
+            "name/value), NOT confirmed. No payloads sent. Validate with Triage (AI) "
+            "or manual testing before reporting.")
+        self._hunt_banner.setOpaque(True)
+        self._hunt_banner.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6))
+        self._skin_hunt_banner()   # theme-aware colours (re-applied on theme switch)
+        north = JPanel(BorderLayout())
+        north.add(header, BorderLayout.NORTH)
+        north.add(self._hunt_banner, BorderLayout.SOUTH)
+        outer.add(north, BorderLayout.NORTH)
+
+        # ── Findings table (left) + detail (right) ──
+        class _Model(DefaultTableModel):
+            def isCellEditable(self, r, c):
+                return False
+        _cols = Vector()
+        for _c in self._HUNT_COLS:
+            _cols.add(_c)
+        self._hunt_model = _Model(_cols, 0)
+        self._hunt_table = JTable(self._hunt_model)
+        self._hunt_table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)
+        self._hunt_table.setRowHeight(22)
+        self._hunt_table.setFont(Font("SansSerif", Font.PLAIN, 12))
+        self._hunt_table.getTableHeader().setReorderingAllowed(False)
+        try:
+            self._hunt_table.setAutoCreateRowSorter(True)
+        except Exception:
+            pass
+
+        # Colour Severity + AI Verdict cells by value (theme resolved at paint time).
+        class _Rend(DefaultTableCellRenderer):
+            def getTableCellRendererComponent(s, table, value, sel, foc, row, col):
+                comp = super(_Rend, s).getTableCellRendererComponent(
+                    table, value, sel, foc, row, col)
+                try:
+                    thm = _theme()
+                    dark = thm.dark
+                    v = (str(value) if value is not None else "").upper()
+                    colr = None
+                    # Order matters: check UNLIKELY before LIKELY (substring), and
+                    # the Status cell may carry a "% confidence" suffix.
+                    if "UNLIKELY" in v:
+                        colr = thm.muted
+                    elif "LIKELY" in v or v == "HIGH":
+                        colr = Color(0xFF8A80) if dark else Color(0xC62828)
+                    elif "POSSIBLE" in v or "POTENTIAL" in v or v == "MEDIUM":
+                        colr = Color(0xFFCC80) if dark else Color(0xE65100)
+                    elif v == "LOW":
+                        colr = Color(0x90CAF9) if dark else Color(0x1565C0)
+                    if colr is not None and not sel:
+                        comp.setForeground(colr)
+                except Exception:
+                    pass
+                return comp
+        _rend = _Rend()
+        # Apply the colouring renderer to Severity (4) and AI Verdict (5).
+        for _ci in (4, 5):
+            try:
+                self._hunt_table.getColumnModel().getColumn(_ci).setCellRenderer(_rend)
+            except Exception:
+                pass
+
+        class _Sel(_ListSelectionListener):
+            def __init__(s, ui): s._ui = ui
+            def valueChanged(s, e):
+                if not e.getValueIsAdjusting():
+                    s._ui._hunt_on_select()
+        self._hunt_table.getSelectionModel().addListSelectionListener(_Sel(self))
+
+        # Right-click → Send to Repeater/Intruder / Copy URL for the selected row.
+        class _HuntMouse(MouseAdapter):
+            def __init__(s, ui): s._ui = ui
+            def mouseReleased(s, e): s._popup(e)
+            def mousePressed(s, e): s._popup(e)
+            def _popup(s, e):
+                if not e.isPopupTrigger():
+                    return
+                tbl = s._ui._hunt_table
+                r = tbl.rowAtPoint(e.getPoint())
+                if r < 0:
+                    return
+                if not tbl.isRowSelected(r):
+                    tbl.setRowSelectionInterval(r, r)
+                menu = JPopupMenu()
+                for _label, _fn in (("Deep Analyze (AI)", s._ui._hunt_deep_analyze),
+                                    ("Send to Repeater", s._ui._hunt_send_repeater),
+                                    ("Send to Intruder", s._ui._hunt_send_intruder),
+                                    ("Copy URL", s._ui._hunt_copy_url)):
+                    mi = JMenuItem(_label)
+                    class _A(_ActionListener):
+                        def __init__(a, f): a._f = f
+                        def actionPerformed(a, ev): a._f()
+                    mi.addActionListener(_A(_fn))
+                    menu.add(mi)
+                menu.show(e.getComponent(), e.getX(), e.getY())
+        self._hunt_table.addMouseListener(_HuntMouse(self))
+
+        table_scroll = JScrollPane(self._hunt_table)
+        table_scroll.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(Color(0xFF6B35), 1), "Candidates"))
+
+        # Right side: detail/methodology on top, the native request/response
+        # viewer for the selected candidate below (with Burp's own right-click:
+        # Send to Repeater/Intruder, etc.).
+        self._hunt_detail = JEditorPane()
+        self._hunt_detail.setEditable(False)
+        _apply_html_theme(self._hunt_detail, is_chat=False)
+        detail_scroll = JScrollPane(self._hunt_detail)
+        detail_scroll.setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(Color(0xFF6B35), 1), "Detail & Methodology"))
+
+        self._hunt_editor_controller = _MessageEditorController()
+        self._hunt_req_editor  = self._callbacks.createMessageEditor(self._hunt_editor_controller, False)
+        self._hunt_resp_editor = self._callbacks.createMessageEditor(self._hunt_editor_controller, False)
+        msg_tabs = JTabbedPane()
+        msg_tabs.addTab("Request",  self._hunt_req_editor.getComponent())
+        msg_tabs.addTab("Response", self._hunt_resp_editor.getComponent())
+
+        right_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, detail_scroll, msg_tabs)
+        right_split.setResizeWeight(0.5)
+        right_split.setDividerLocation(240)
+        right_split.setContinuousLayout(True)
+
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, table_scroll, right_split)
+        split.setResizeWeight(0.55)
+        split.setDividerLocation(520)
+        split.setContinuousLayout(True)
+        outer.add(split, BorderLayout.CENTER)
+
+        self._hunt_render_empty()
+        self._hunt_update_count()
+        return outer
+
+    # ── Passive ingestion (called from the IHttpListener, Burp thread) ──────────
+
+    def set_scanner(self, scanner):
+        """Wire the scanner so the UI can trigger Deep Analyze and reach memory."""
+        self._scanner = scanner
+
+    def is_hunt_passive(self):
+        try:
+            return bool(self._hunt_passive_cb.isSelected())
+        except Exception:
+            return False
+
+    def _skin_hunt_banner(self):
+        """Theme-aware colours for the POTENTIAL disclaimer banner (re-applied when
+        the user switches Light/Dark)."""
+        try:
+            th = _theme()
+            self._hunt_banner.setBackground(Color(0x3A2E1A) if th.dark else Color(0xFFF3E0))
+            self._hunt_banner.setForeground(Color(0xFFCC80) if th.dark else Color(0xB35A00))
+            self._hunt_banner.repaint()
+        except Exception:
+            pass
+
+    def hunt_passive_scan(self, message):
+        """Run heuristics on one proxied message and add new hits (thread-safe)."""
+        try:
+            hits = _hunt.analyze(self._helpers, message)
+        except Exception:
+            return
+        if not hits:
+            return
+        for h in hits:
+            h["_msg"] = message      # keep the exchange for later AI triage
+        class _Add(_JRunnable):
+            def __init__(s, ui, hh): s._ui = ui; s._hh = hh
+            def run(s): s._ui._hunt_add_hits(s._hh)
+        SwingUtilities.invokeLater(_Add(self, hits))
+
+    def _hunt_add_hits(self, hits):
+        """EDT: append genuinely-new hits, incrementally add matching rows."""
+        MAX = 4000
+        added_visible = 0
+        for h in hits:
+            key = h.get("dedup_key")
+            if not key or key in self._hunt_keys:
+                continue
+            if len(self._hunt_all) >= MAX:
+                break
+            self._hunt_keys.add(key)
+            self._hunt_all.append(h)
+            if self._hunt_matches(h):
+                self._hunt_model.addRow(self._hunt_row(h))
+                self._hunt_view.append(h)
+                added_visible += 1
+        if added_visible:
+            self._hunt_update_count()
+
+    # ── Table helpers ───────────────────────────────────────────────────────────
+
+    def _hunt_status_text(self, h):
+        """Status cell: 'Potential' until triaged, then 'LIKELY 82%' etc."""
+        v = h.get("ai_verdict")
+        if not v:
+            return u"Potential"
+        c = h.get("ai_confidence")
+        return u"{0} {1}%".format(v, c) if c else v
+
+    def _hunt_row(self, h):
+        # "Status" reads Potential until the AI (or you) validate it — never
+        # present a heuristic candidate as a confirmed finding.
+        return [h["cls"], h["endpoint"], h["param"], h["where"], h["sev"],
+                self._hunt_status_text(h)]
+
+    def _hunt_matches(self, h):
+        try:
+            cls = str(self._hunt_class_combo.getSelectedItem())
+        except Exception:
+            cls = "All classes"
+        if cls and cls != "All classes" and h["cls"] != cls:
+            return False
+        q = ""
+        try:
+            q = (self._hunt_filter.getText() or "").strip().lower()
+        except Exception:
+            pass
+        if q:
+            hay = u"{0} {1} {2} {3}".format(
+                h["cls"], h["endpoint"], h["param"], h.get("ai_verdict", "")).lower()
+            if q not in hay:
+                return False
+        return True
+
+    def _hunt_rebuild_table(self):
+        try:
+            self._hunt_model.setRowCount(0)
+        except Exception:
+            return
+        self._hunt_view = []
+        for h in self._hunt_all:
+            if self._hunt_matches(h):
+                self._hunt_model.addRow(self._hunt_row(h))
+                self._hunt_view.append(h)
+        self._hunt_update_count()
+
+    def _hunt_refresh_row(self, h):
+        """Update the AI Verdict cell for a hit already shown (after triage)."""
+        try:
+            idx = self._hunt_view.index(h)
+        except ValueError:
+            return
+        try:
+            # account for a row sorter (view vs model index)
+            self._hunt_model.setValueAt(self._hunt_status_text(h), idx, 5)
+        except Exception:
+            pass
+
+    def _hunt_update_count(self):
+        total = len(self._hunt_all)
+        shown = len(self._hunt_view)
+        triaged = sum(1 for h in self._hunt_all if h.get("ai_verdict"))
+        self._hunt_count_lbl.setText(
+            "  {0} shown / {1} total  |  {2} AI-triaged".format(shown, total, triaged))
+
+    def _hunt_on_select(self):
+        try:
+            row = self._hunt_table.getSelectedRow()
+            if row < 0:
+                return
+            mrow = self._hunt_table.convertRowIndexToModel(row)
+            if mrow < 0 or mrow >= len(self._hunt_view):
+                return
+            h = self._hunt_view[mrow]
+            self._hunt_render_detail(h)
+            self._hunt_show_message(h.get("_msg"))
+        except Exception:
+            pass
+
+    def _hunt_show_message(self, msg):
+        """Load the selected candidate's request/response into the native viewer."""
+        try:
+            if msg is not None:
+                self._hunt_editor_controller.set_message(msg)
+                req  = msg.getRequest()
+                resp = msg.getResponse()
+                self._hunt_req_editor.setMessage(req if req else [], True)
+                self._hunt_resp_editor.setMessage(resp if resp else [], False)
+            else:
+                self._hunt_editor_controller.set_message(None)
+                self._hunt_req_editor.setMessage([], True)
+                self._hunt_resp_editor.setMessage([], False)
+        except Exception:
+            pass
+
+    def _hunt_selected_hit(self):
+        try:
+            row = self._hunt_table.getSelectedRow()
+            if row < 0:
+                return None
+            mrow = self._hunt_table.convertRowIndexToModel(row)
+            if 0 <= mrow < len(self._hunt_view):
+                return self._hunt_view[mrow]
+        except Exception:
+            pass
+        return None
+
+    def _hunt_send_repeater(self):
+        h = self._hunt_selected_hit()
+        if not h or not h.get("_msg"):
+            self._status_lbl.setText("No captured request for this candidate.")
+            return
+        try:
+            msg = h["_msg"]; svc = msg.getHttpService()
+            self._callbacks.sendToRepeater(
+                svc.getHost(), svc.getPort(), svc.getProtocol() == "https",
+                msg.getRequest(), "Hunt:" + h.get("param", ""))
+            self._status_lbl.setText("Sent to Repeater: " + h.get("endpoint", ""))
+        except Exception as ex:
+            self._status_lbl.setText("Send to Repeater failed: " + str(ex))
+
+    def _hunt_send_intruder(self):
+        h = self._hunt_selected_hit()
+        if not h or not h.get("_msg"):
+            self._status_lbl.setText("No captured request for this candidate.")
+            return
+        try:
+            msg = h["_msg"]; svc = msg.getHttpService()
+            self._callbacks.sendToIntruder(
+                svc.getHost(), svc.getPort(), svc.getProtocol() == "https",
+                msg.getRequest())
+            self._status_lbl.setText("Sent to Intruder: " + h.get("endpoint", ""))
+        except Exception as ex:
+            self._status_lbl.setText("Send to Intruder failed: " + str(ex))
+
+    def _hunt_copy_url(self):
+        h = self._hunt_selected_hit()
+        if not h:
+            return
+        try:
+            from java.awt import Toolkit
+            from java.awt.datatransfer import StringSelection
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                StringSelection(h.get("url", "")), None)
+            self._status_lbl.setText("Copied URL.")
+        except Exception as ex:
+            self._status_lbl.setText("Copy failed: " + str(ex))
+
+    def _hunt_deep_analyze(self):
+        """Send the selected candidate's captured exchange to the full Results
+        'Analyze with AI' pipeline (heuristic candidate -> deep AI analysis)."""
+        h = self._hunt_selected_hit()
+        if not h or not h.get("_msg"):
+            self._status_lbl.setText("No captured request for this candidate.")
+            return
+        scanner = getattr(self, "_scanner", None)
+        if scanner is None:
+            self._status_lbl.setText("Scanner not ready.")
+            return
+        try:
+            scanner.analyze_message(h["_msg"])
+            try:
+                self._tabs.setSelectedIndex(1)   # jump to Results to watch it run
+            except Exception:
+                pass
+            self._status_lbl.setText("Deep analyzing: " + h.get("endpoint", ""))
+        except Exception as ex:
+            self._status_lbl.setText("Deep analyze failed: " + str(ex))
+
+    # ── Detail rendering ────────────────────────────────────────────────────────
+
+    def _hunt_render_empty(self):
+        th = _theme()
+        body = ("<div style='color:{0}'>"
+                "<p><b>AI Hunt</b> flags suspicious parameters by name/value (HUNT-style) "
+                "with no payloads and no AI cost, then lets you triage the promising ones "
+                "with the LLM on demand.</p>"
+                "<p><b>To start:</b> tick <b>Passive (Proxy)</b> above, then browse the "
+                "target through Burp &mdash; candidates appear here as you go. "
+                "(Static assets are skipped; scanning runs off the proxy thread so it stays light.)</p>"
+                "<p>Select a candidate to see why it was flagged, the testing methodology, "
+                "and suggested payloads. Use <b>Triage (AI)</b> to have the model confirm "
+                "and tailor payloads to the real request/response.</p>"
+                "</div>").format(th.muted_hex())
+        self._hunt_detail.setText("<html><body>" + body + "</body></html>")
+
+    def _hunt_render_detail(self, h):
+        th = _theme()
+        acc = "#FF6B35"
+        sev_c = {"High": "#E53935", "Medium": "#FB8C00", "Low": "#1E88E5"}.get(h["sev"], th.muted_hex())
+        parts = []
+        parts.append(u"<h2 style='color:{0};margin:2px 0'>Potential: {1}</h2>".format(
+            acc, _html_escape(h["cls"])))
+        # Always-visible "not confirmed" note, unless AI already judged it.
+        if not h.get("ai_verdict"):
+            warn = "#FFB74D" if th.dark else "#B35A00"
+            parts.append(u"<p style='margin:2px 0;color:{0}'><i>Heuristic candidate — "
+                         u"<b>not confirmed</b>. No payload was sent. Validate with "
+                         u"Triage (AI) or manual testing.</i></p>".format(warn))
+        parts.append(u"<p style='margin:2px 0'><b style='color:{0}'>{1}</b> potential impact "
+                     u"&nbsp; <code>{2}</code></p>".format(sev_c, h["sev"], _html_escape(h["endpoint"])))
+        parts.append(u"<p style='margin:2px 0'>Parameter <b>{0}</b> "
+                     u"<span style='color:{1}'>({2})</span>{3}</p>".format(
+                         _html_escape(h["param"]), th.muted_hex(), _html_escape(h["where"]),
+                         (u" = <code>" + _html_escape(h["value"]) + u"</code>") if h["value"] else u""))
+        parts.append(u"<p style='margin:6px 0'>{0}</p>".format(_html_escape(h["why"])))
+
+        # Evidence excerpt: show the request line with the parameter highlighted,
+        # and (if the value is reflected) the response snippet highlighted.
+        try:
+            msg = h.get("_msg")
+            param = h.get("param", "")
+            hl = "#FF6B35"
+            if msg is not None and param and h.get("where") != "ai":
+                rb = msg.getRequest()
+                req_txt = self._helpers.bytesToString(rb) if rb else u""
+                line, _i = _hunt.request_param_excerpt(req_txt, param)
+                if line:
+                    esc = _html_escape(line)
+                    # bold+colour the param token within the escaped line
+                    esc = esc.replace(_html_escape(param),
+                                      u"<b style='color:{0}'>{1}</b>".format(hl, _html_escape(param)), 1)
+                    parts.append(u"<p style='margin:6px 0 0'><b>In request:</b></p>"
+                                 u"<pre>{0}</pre>".format(esc))
+                val = h.get("value_full") or h.get("value")
+                if val:
+                    sb = msg.getResponse()
+                    resp_txt = self._helpers.bytesToString(sb) if sb else u""
+                    snip = _hunt.response_reflection_excerpt(resp_txt, val)
+                    if snip:
+                        esc = _html_escape(snip)
+                        esc = esc.replace(_html_escape(val),
+                                          u"<b style='color:{0}'>{1}</b>".format(hl, _html_escape(val)), 1)
+                        parts.append(u"<p style='margin:6px 0 0;color:#2e7d32'><b>Reflected in "
+                                     u"response:</b></p><pre>{0}</pre>".format(esc))
+        except Exception:
+            pass
+
+        v = h.get("ai_verdict")
+        if v:
+            vc = {"LIKELY": "#2e7d32", "POSSIBLE": "#E65100", "UNLIKELY": th.muted_hex()}.get(v, th.muted_hex())
+            if th.dark:
+                vc = {"LIKELY": "#A5D6A7", "POSSIBLE": "#FFCC80", "UNLIKELY": th.muted_hex()}.get(v, th.muted_hex())
+            conf = h.get("ai_confidence")
+            head = u"AI verdict: {0}".format(v)
+            if conf:
+                head += u" &nbsp;<span style='color:{0}'>(confidence {1}%)</span>".format(th.muted_hex(), conf)
+            parts.append(u"<div style='margin:8px 0'><b style='color:{0}'>{1}</b></div>".format(vc, head))
+            if h.get("ai_reason"):
+                parts.append(u"<p style='margin:2px 0'><b>Evidence:</b> {0}</p>".format(
+                    _html_escape(h["ai_reason"])))
+            if h.get("ai_payloads"):
+                parts.append(u"<b style='color:{0}'>AI-tailored payloads</b><pre>{1}</pre>".format(
+                    acc, _html_escape("\n".join(h["ai_payloads"]))))
+            if h.get("ai_next"):
+                parts.append(u"<p style='margin:2px 0'><b>Next step:</b> {0}</p>".format(
+                    _html_escape(h["ai_next"])))
+
+        parts.append(u"<h3 style='color:{0};margin:8px 0 2px'>Methodology</h3>"
+                     u"<p style='margin:2px 0'>{1}</p>".format(acc, _html_escape(h["methodology"])))
+        if h.get("payloads"):
+            parts.append(u"<h3 style='color:{0};margin:8px 0 2px'>Try these</h3><pre>{1}</pre>".format(
+                acc, _html_escape("\n".join(h["payloads"]))))
+        self._hunt_detail.setText("<html><body>" + "".join(parts) + "</body></html>")
+        self._hunt_detail.setCaretPosition(0)
+
+    # ── AI triage (on-demand, background) ───────────────────────────────────────
+
+    def _hunt_triage(self, scope):
+        if self._hunt_busy:
+            self._status_lbl.setText("Hunt triage already running...")
+            return
+        # Choose target hits
+        targets = []
+        if scope == "selected":
+            rows = self._hunt_table.getSelectedRows()
+            for r in rows:
+                try:
+                    mr = self._hunt_table.convertRowIndexToModel(r)
+                    if 0 <= mr < len(self._hunt_view):
+                        targets.append(self._hunt_view[mr])
+                except Exception:
+                    pass
+            if not targets:
+                self._status_lbl.setText("Select one or more candidates first.")
+                return
+        else:
+            targets = list(self._hunt_view)
+            if not targets:
+                self._status_lbl.setText("No candidates to triage.")
+                return
+
+        # Group by endpoint, keeping a representative message per group.
+        groups = []   # list of (endpoint, msg, [hits])
+        by_ep = {}
+        for h in targets:
+            ep = h["endpoint"]
+            if ep not in by_ep:
+                by_ep[ep] = (h.get("_msg"), [])
+                groups.append(ep)
+            by_ep[ep][1].append(h)
+
+        MAX_GROUPS = 30
+        ordered = [(ep, by_ep[ep][0], by_ep[ep][1]) for ep in groups]
+        capped = ordered[:MAX_GROUPS]
+        remainder = len(ordered) - len(capped)
+
+        provider = self.get_provider()
+        settings = self.get_provider_settings()
+        max_tokens = self.get_max_tokens()
+
+        self._hunt_busy = True
+        self._status_lbl.setText("AI triage: 0/{0} endpoints...".format(len(capped)))
+
+        import threading
+        def _worker():
+          try:
+            done = 0
+            for ep, msg, hits in capped:
+                # NOTE: deliberately does NOT check the Results-tab cancel flag —
+                # that flag can be left True by a prior "Stop" and would silently
+                # abort triage. Triage is bounded (MAX_GROUPS) instead.
+                try:
+                    req_txt = resp_txt = u""
+                    if msg is not None:
+                        try:
+                            rb = msg.getRequest()
+                            req_txt = self._helpers.bytesToString(rb) if rb else u""
+                        except Exception:
+                            pass
+                        try:
+                            sb = msg.getResponse()
+                            resp_txt = self._helpers.bytesToString(sb) if sb else u""
+                        except Exception:
+                            pass
+                    sys_p, usr_p = _hunt.build_triage_prompt(ep, hits, req_txt, resp_txt)
+                    out = self._api_client.call_api(
+                        provider=provider, settings=settings,
+                        system_prompt=sys_p, user_prompt=usr_p,
+                        max_tokens=min(int(max_tokens) if max_tokens else 1200, 1500))
+                    verdicts = _hunt.parse_triage(out)
+                    for i, h in enumerate(hits):
+                        vv = verdicts.get(i)
+                        if vv:
+                            verdict, conf, evidence, payloads, nxt = vv
+                            h["ai_verdict"] = verdict
+                            h["ai_confidence"] = conf
+                            h["ai_reason"] = evidence
+                            h["ai_payloads"] = payloads
+                            h["ai_next"] = nxt
+                except Exception as ex:
+                    self._log("Hunt triage error for {0}: {1}".format(ep, str(ex)))
+                done += 1
+
+                class _Prog(_JRunnable):
+                    def __init__(s, ui, d, hh): s._ui = ui; s._d = d; s._hh = hh
+                    def run(s):
+                        s._ui._status_lbl.setText(
+                            "AI triage: {0}/{1} endpoints...".format(s._d, len(capped)))
+                        for _h in s._hh:
+                            s._ui._hunt_refresh_row(_h)
+                        s._ui._hunt_update_count()
+                        s._ui.refresh_token_label()
+                SwingUtilities.invokeLater(_Prog(self, done, hits))
+
+            class _Fin(_JRunnable):
+                def __init__(s, ui): s._ui = ui
+                def run(s):
+                    s._ui._hunt_busy = False
+                    msg = "AI triage complete ({0} endpoint(s)).".format(len(capped))
+                    if remainder > 0:
+                        msg += " {0} more not triaged (cap {1}).".format(remainder, MAX_GROUPS)
+                    s._ui._status_lbl.setText(msg)
+                    s._ui._hunt_on_select()   # refresh detail of current selection
+            SwingUtilities.invokeLater(_Fin(self))
+          finally:
+            # Safety net: never leave triage permanently "busy" even if something
+            # above throws before _Fin is scheduled.
+            class _Rst(_JRunnable):
+                def __init__(s, ui): s._ui = ui
+                def run(s): s._ui._hunt_busy = False
+            SwingUtilities.invokeLater(_Rst(self))
+
+        t = threading.Thread(target=_worker)
+        t.daemon = True
+        t.start()
+
+    def _hunt_discover(self, scope):
+        """AI auto-discovery: ask the model to propose issues the heuristics missed,
+        for the selected candidate's endpoint. Adds new 'AI:' rows."""
+        if self._hunt_busy:
+            self._status_lbl.setText("Hunt AI task already running...")
+            return
+        h = self._hunt_selected_hit()
+        if not h or not h.get("_msg"):
+            self._status_lbl.setText("Select a candidate (with a captured request) first.")
+            return
+        msg = h["_msg"]; method = h.get("method", "GET"); path = h.get("path", "/")
+        full_url = h.get("url", "")
+        try:
+            netloc = h.get("endpoint", " ").split(" ", 1)[1]
+            netloc = netloc[:len(netloc) - len(path)] if path and netloc.endswith(path) else netloc
+        except Exception:
+            netloc = ""
+        provider = self.get_provider(); settings = self.get_provider_settings()
+        max_tokens = self.get_max_tokens()
+        self._hunt_busy = True
+        self._status_lbl.setText("AI discovery on " + h.get("endpoint", "") + " ...")
+
+        import threading
+        def _worker():
+          try:
+            req_txt = resp_txt = u""
+            try:
+                rb = msg.getRequest(); req_txt = self._helpers.bytesToString(rb) if rb else u""
+            except Exception:
+                pass
+            try:
+                sb = msg.getResponse(); resp_txt = self._helpers.bytesToString(sb) if sb else u""
+            except Exception:
+                pass
+            sys_p, usr_p = _hunt.build_discovery_prompt(h.get("endpoint", ""), req_txt, resp_txt)
+            out = self._api_client.call_api(
+                provider=provider, settings=settings, system_prompt=sys_p,
+                user_prompt=usr_p,
+                max_tokens=min(int(max_tokens) if max_tokens else 1600, 2000))
+            # Log the raw reply so a non-conforming / empty model response (e.g. prose,
+            # or a provider returning reasoning-only) is diagnosable, not a silent 0.
+            try:
+                self._log(u"AI discovery raw reply ({0} chars): {1}".format(
+                    len(out or u""), (out or u"(empty)")[:800]))
+            except Exception:
+                pass
+            new_hits = _hunt.parse_discovery(out, method, netloc, path, full_url)
+            for nh in new_hits:
+                nh["_msg"] = msg
+            raw_len = len(out or u"")
+            class _Add(_JRunnable):
+                def __init__(s, ui, hh): s._ui = ui; s._hh = hh
+                def run(s):
+                    before = len(s._ui._hunt_all)
+                    s._ui._hunt_add_hits(s._hh)
+                    added = len(s._ui._hunt_all) - before
+                    s._ui.refresh_token_label()
+                    if added:
+                        s._ui._status_lbl.setText(
+                            "AI discovery: added {0} new candidate(s).".format(added))
+                    elif not s._hh:
+                        s._ui._status_lbl.setText(
+                            "AI discovery: model returned no parseable findings "
+                            "(raw reply {0} chars -- see Extensions output; try another "
+                            "model or raise Max Tokens).".format(raw_len))
+                    else:
+                        s._ui._status_lbl.setText(
+                            "AI discovery: no NEW candidates (all already listed).")
+            SwingUtilities.invokeLater(_Add(self, new_hits))
+          except Exception as ex:
+            self._log("Hunt discovery error: {0}".format(str(ex)))
+          finally:
+            class _Rst(_JRunnable):
+                def __init__(s, ui): s._ui = ui
+                def run(s): s._ui._hunt_busy = False
+            SwingUtilities.invokeLater(_Rst(self))
+        t = threading.Thread(target=_worker)
+        t.daemon = True
+        t.start()
+
+    def _hunt_scan_history(self):
+        """Retroactively run the passive heuristics over Burp's existing Proxy
+        history, so candidates appear for traffic browsed BEFORE Passive was enabled
+        (or with it off). Runs off the EDT; honours 'Scope only' + static-asset skip;
+        flushes rows in batches so the UI stays responsive on large histories."""
+        if getattr(self, "_hunt_hist_busy", False):
+            self._status_lbl.setText("Proxy-history scan already running...")
+            return
+        self._hunt_hist_busy = True
+        self._status_lbl.setText("Scanning Proxy history...")
+
+        import threading
+        def _worker():
+          added = [0]
+          scanned = [0]
+          try:
+            try:
+                hist = self._callbacks.getProxyHistory() or []
+            except Exception:
+                hist = []
+            try:
+                scope_only = bool(self.get_scope_only())
+            except Exception:
+                scope_only = False
+            MAXHIST = 8000            # bound work on very large histories
+            batch = []
+
+            def _flush(chunk):
+                class _Add(_JRunnable):
+                    def __init__(s, ui, hh): s._ui = ui; s._hh = hh
+                    def run(s): s._ui._hunt_add_hits(s._hh)
+                SwingUtilities.invokeLater(_Add(self, chunk))
+
+            for msg in list(hist)[:MAXHIST]:
+                scanned[0] += 1
+                try:
+                    url = self._helpers.analyzeRequest(msg).getUrl()
+                    if _hunt.is_static_url(url.toString()):
+                        continue
+                    if scope_only and not self._callbacks.isInScope(url):
+                        continue
+                    hits = _hunt.analyze(self._helpers, msg)
+                except Exception:
+                    continue
+                if not hits:
+                    continue
+                for h in hits:
+                    h["_msg"] = msg
+                batch.extend(hits)
+                added[0] += len(hits)
+                if len(batch) >= 200:
+                    _flush(batch)
+                    batch = []
+            if batch:
+                _flush(batch)
+          except Exception as ex:
+            self._log("Scan History error: " + str(ex))
+          finally:
+            _sc = scanned[0]
+            class _Fin(_JRunnable):
+                def __init__(s, ui, n): s._ui = ui; s._n = n
+                def run(s):
+                    s._ui._hunt_hist_busy = False
+                    s._ui._hunt_update_count()
+                    s._ui._status_lbl.setText(
+                        "Scanned {0} proxy message(s). See AI Hunt candidates "
+                        "(Scope only affects what's included).".format(s._n))
+            SwingUtilities.invokeLater(_Fin(self, _sc))
+
+        t = threading.Thread(target=_worker)
+        t.daemon = True
+        t.start()
+
+    def _hunt_clear(self):
+        self._hunt_all = []
+        self._hunt_view = []
+        self._hunt_keys = set()
+        try:
+            self._hunt_model.setRowCount(0)
+        except Exception:
+            pass
+        self._hunt_render_empty()
+        self._hunt_show_message(None)
+        self._hunt_update_count()
+        self._status_lbl.setText("Hunt cleared.")
+
+    # -- dashboard tab ---------------------------------------------------------
+
+    def _build_dashboard(self):
+        self._dash_panel = JPanel(BorderLayout(4, 4))
+        self._dash_panel.setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6))
+        header = JPanel(FlowLayout(FlowLayout.LEFT, 8, 2))
+        title = JLabel("Dashboard")
+        title.setForeground(Color(0xFF6B35))
+        title.setFont(title.getFont().deriveFont(Font.BOLD, 13.0))
+        header.add(title)
+        refresh = self._skin_btn(JButton("Refresh"), "secondary")
+        refresh.addActionListener(lambda e: self._refresh_dashboard())
+        header.add(refresh)
+        self._dash_panel.add(header, BorderLayout.NORTH)
+        self._dash_view = JEditorPane()
+        self._dash_view.setEditable(False)
+        _apply_html_theme(self._dash_view, is_chat=False)
+        self._dash_panel.add(JScrollPane(self._dash_view), BorderLayout.CENTER)
+        self._refresh_dashboard()
+        return self._dash_panel
+
+    def _refresh_dashboard(self):
+        import time
+        try:
+            th = _theme()
+            # Re-apply the themed HTML kit + component background on every refresh so
+            # the dashboard never keeps a stale (e.g. dark) background after a
+            # Light/Dark switch — otherwise it renders as a black block on Light.
+            try:
+                _apply_html_theme(self._dash_view, is_chat=False)
+            except Exception:
+                pass
+            esc   = _html_escape
+            dark  = th.dark
+            acc   = "#FF6B35"
+            muted = th.muted_hex()
+            SEVC  = {"High": "#E53935", "Medium": "#FB8C00", "Low": "#1E88E5",
+                     "Information": "#9E9E9E"}
+            VC    = {"LIKELY": "#2e7d32", "POSSIBLE": "#E65100",
+                     "Potential": "#B35A00", "UNLIKELY": "#9E9E9E"}
+            head_bg = "#3a3f44" if dark else "#eef1f5"
+            card_bg = "#33373b" if dark else "#fafbfc"
+
+            def tint(kind):
+                if dark:
+                    return {"High": "#4a2c2c", "Medium": "#4a3b26", "Low": "#26384a",
+                            "Confirmed": "#25402c", "Potential": "#40331f",
+                            "n": "#2f3438"}.get(kind, "#2f3438")
+                return {"High": "#fdecea", "Medium": "#fff4e5", "Low": "#e8f1fc",
+                        "Confirmed": "#e7f4ea", "Potential": "#fff2e0",
+                        "n": "#f2f4f7"}.get(kind, "#f2f4f7")
+
+            def num(n):
+                try:
+                    return u"{0:,}".format(int(n))
+                except Exception:
+                    return u"{0}".format(n)
+
+            # ── gather data ─────────────────────────────────────────────────
+            sev = {"High": 0, "Medium": 0, "Low": 0, "Information": 0}
+            fp = confirmed = potential = 0
+            hosts = {}
+            for key, iss in self._all_findings.items():
+                if iss is None:
+                    continue
+                if key.startswith("[FP]"):
+                    fp += 1
+                    continue
+                s = iss.getSeverity()
+                sev[s] = sev.get(s, 0) + 1
+                try:
+                    cf = (iss.getConfidence() or u"").lower()
+                    nm = (iss.getIssueName() or u"")
+                except Exception:
+                    cf = nm = u""
+                if cf in ("certain", "firm") and not nm.lower().startswith("potential"):
+                    confirmed += 1
+                else:
+                    potential += 1
+                try:
+                    uo = iss.getUrl()
+                    host = (uo.getHost() or u"") if uo else u""
+                    prt = uo.getPort() if uo else -1
+                    if host and prt not in (80, 443, -1, 0):
+                        host = u"{0}:{1}".format(host, prt)
+                except Exception:
+                    host = u""
+                if host:
+                    d = hosts.setdefault(host, {"High": 0, "Medium": 0, "Low": 0, "Information": 0})
+                    d[s] = d.get(s, 0) + 1
+            total = sev["High"] + sev["Medium"] + sev["Low"] + sev["Information"]
+            maxsev = max([1, sev["High"], sev["Medium"], sev["Low"], sev["Information"]])
+
+            hunt_cls = {}
+            hunt_status = {}
+            triaged = 0
+            for h in getattr(self, "_hunt_all", []):
+                hunt_cls[h["cls"]] = hunt_cls.get(h["cls"], 0) + 1
+                st = h.get("ai_verdict") or "Potential"
+                hunt_status[st] = hunt_status.get(st, 0) + 1
+                if h.get("ai_verdict"):
+                    triaged += 1
+            hunt_total = len(getattr(self, "_hunt_all", []))
+
+            mem_fp = mem_cf = 0
+            sc = getattr(self, "_scanner", None)
+            if sc is not None and hasattr(sc, "memory"):
+                try:
+                    mem_fp, mem_cf = sc.memory.stats()
+                except Exception:
+                    pass
+            req_analyzed = None
+            try:
+                if sc is not None and hasattr(sc, "_seen_hashes"):
+                    req_analyzed = len(sc._seen_hashes)
+            except Exception:
+                pass
+            try:
+                usage = _get_usage() or {}
+            except Exception:
+                usage = {}
+            tok = int(usage.get("total", 0)) if usage else 0
+            try:
+                prov, model = self._active_model()
+            except Exception:
+                prov, model = (u"", u"")
+
+            # risk posture: severity-first (any High => at least HIGH), with a
+            # weighted score only escalating to CRITICAL.
+            score = 10 * sev["High"] + 4 * sev["Medium"] + 1 * sev["Low"]
+            if total == 0:
+                risk_lbl, risk_c = "NO DATA", muted
+            elif sev["High"] >= 3 or score >= 40:
+                risk_lbl, risk_c = "CRITICAL", "#B71C1C"
+            elif sev["High"] >= 1:
+                risk_lbl, risk_c = "HIGH", "#E53935"
+            elif sev["Medium"] >= 1:
+                risk_lbl, risk_c = "MEDIUM", "#FB8C00"
+            elif sev["Low"] >= 1:
+                risk_lbl, risk_c = "LOW", "#1E88E5"
+            else:
+                risk_lbl, risk_c = "CLEAN", "#2e7d32"
+
+            # ── builders ────────────────────────────────────────────────────
+            def tile(label, value, numc, bg):
+                return (u"<td width='84' bgcolor='{0}' align='center'>"
+                        u"<font size='6' color='{1}'><b>{2}</b></font><br>"
+                        u"<font size='2' color='{3}'>{4}</font></td>").format(
+                            bg, numc, esc(u"{0}".format(value)), muted, esc(label))
+
+            def bar(label, count, maxc, color, denom):
+                w = int(190.0 * count / maxc) if maxc > 0 else 0
+                if count > 0 and w < 6:
+                    w = 6
+                pct = u"  <font color='{0}'>({1}%)</font>".format(
+                    muted, int(round(100.0 * count / denom))) if denom else u""
+                return (u"<tr><td><font size='3'>{0}</font></td>"
+                        u"<td><table cellspacing='0' cellpadding='0'><tr>"
+                        u"<td bgcolor='{1}' width='{2}'>&nbsp;</td>"
+                        u"<td>&nbsp;<b>{3}</b>{4}</td></tr></table></td></tr>").format(
+                            esc(label), color, w, count, pct)
+
+            def card(title, inner):
+                return (u"<table width='100%' cellspacing='0' cellpadding='5' border='0'>"
+                        u"<tr><td bgcolor='{0}'><font color='{1}'><b>{2}</b></font></td></tr>"
+                        u"<tr><td bgcolor='{3}'>{4}</td></tr></table><br>").format(
+                            head_bg, acc, esc(title), card_bg, inner)
+
+            H = []
+
+            # header band + risk pill
+            meta = []
+            if model:
+                meta.append(u"Model: {0} / {1}".format(esc(prov), esc(model)))
+            elif prov:
+                meta.append(u"Model: {0}".format(esc(prov)))
+            meta.append(u"Updated " + time.strftime("%H:%M:%S"))
+            meta.append(u"Hosts {0}".format(len(hosts)))
+            if req_analyzed is not None:
+                meta.append(u"Requests {0}".format(req_analyzed))
+            pill = (u"<table cellspacing='0' cellpadding='2' border='0'><tr>"
+                    u"<td bgcolor='{0}'>&nbsp;<font color='#ffffff'><b>{1}</b></font>&nbsp;"
+                    u"</td></tr></table>").format(risk_c, esc(risk_lbl))
+            H.append(
+                u"<table width='100%' cellspacing='0' cellpadding='6' border='0'>"
+                u"<tr><td bgcolor='{0}'><font size='5' color='{1}'><b>VeriHunt</b></font>"
+                u"&nbsp;&nbsp;<font color='{2}'>Security Posture</font></td>"
+                u"<td bgcolor='{0}' align='right'><font size='2' color='{2}'>RISK</font>"
+                u"&nbsp;{3}</td></tr></table>".format(head_bg, acc, muted, pill))
+            # meta parts are already escaped where needed (Model prov/model); do NOT
+            # re-escape the joined string or '&' in a model id would double-encode.
+            H.append(u"<font size='2' color='{0}'>{1}</font><br><br>".format(
+                muted, u"   " + u"  |  ".join(meta)))
+
+            # KPI tiles
+            H.append(u"<table cellspacing='4' cellpadding='4' border='0'><tr>")
+            H.append(tile("FINDINGS", total, acc, tint("n")))
+            H.append(tile("HIGH", sev["High"], SEVC["High"], tint("High")))
+            H.append(tile("MEDIUM", sev["Medium"], SEVC["Medium"], tint("Medium")))
+            H.append(tile("LOW", sev["Low"], SEVC["Low"], tint("Low")))
+            H.append(tile("CONFIRMED", confirmed, "#2e7d32", tint("Confirmed")))
+            H.append(tile("POTENTIAL", potential, "#E65100", tint("Potential")))
+            H.append(tile("HUNT", hunt_total, acc, tint("n")))
+            H.append(tile("TOKENS", num(tok), (muted if tok == 0 else "#1E88E5"), tint("n")))
+            H.append(u"</tr></table><br>")
+
+            # two columns: severity | AI hunt coverage
+            if total:
+                sv = [u"<table cellspacing='0' cellpadding='1'>"]
+                for s in ("High", "Medium", "Low", "Information"):
+                    sv.append(bar(s, sev[s], maxsev, SEVC[s], total))
+                sv.append(u"</table>")
+                sv.append(u"<font size='2' color='{0}'>Total {1} active"
+                          u"{2}</font>".format(
+                              muted, total,
+                              (u"  |  {0} false positive".format(fp) if fp else u"")))
+                sev_inner = u"".join(sv)
+            else:
+                sev_inner = (u"<font color='{0}'><i>No findings yet. Analyze a request "
+                             u"or click Load Demo in Results.</i></font>".format(muted))
+
+            if hunt_total:
+                hv = [u"<font size='3'>Candidates <b>{0}</b> &nbsp; Triaged <b>{1}</b>"
+                      u" ({2}%)</font><br><br>".format(
+                          hunt_total, triaged,
+                          int(round(100.0 * triaged / hunt_total)) if hunt_total else 0)]
+                chips = []
+                for st in ("LIKELY", "POSSIBLE", "Potential", "UNLIKELY"):
+                    if hunt_status.get(st):
+                        chips.append(u"<font color='{0}'><b>{1}</b> {2}</font>".format(
+                            VC.get(st, muted), hunt_status[st], st))
+                hv.append(u" &nbsp;|&nbsp; ".join(chips) if chips else u"")
+                top = sorted(hunt_cls.items(), key=lambda kv: -kv[1])[:5]
+                if top:
+                    hv.append(u"<br><br><font size='2' color='{0}'>Top classes:</font><br>".format(muted))
+                    hv.append(u", ".join(u"{0} <b>{1}</b>".format(esc(c), n) for c, n in top))
+                hunt_inner = u"".join(hv)
+            else:
+                hunt_inner = (u"<font color='{0}'><i>No AI Hunt candidates yet. Enable "
+                              u"Passive (Proxy) and browse, or press Scan History.</i>"
+                              u"</font>".format(muted))
+
+            H.append(
+                u"<table width='100%' cellspacing='0' cellpadding='0' border='0'><tr>"
+                u"<td valign='top' width='49%' bgcolor='{0}'>"
+                u"<table width='100%' cellpadding='5'><tr><td bgcolor='{1}'>"
+                u"<font color='{2}'><b>Findings by Severity</b></font></td></tr>"
+                u"<tr><td>{3}</td></tr></table></td>"
+                u"<td width='2%'>&nbsp;</td>"
+                u"<td valign='top' width='49%' bgcolor='{0}'>"
+                u"<table width='100%' cellpadding='5'><tr><td bgcolor='{1}'>"
+                u"<font color='{2}'><b>AI Hunt Coverage</b></font></td></tr>"
+                u"<tr><td>{4}</td></tr></table></td>"
+                u"</tr></table><br>".format(card_bg, head_bg, acc, sev_inner, hunt_inner))
+
+            # top affected hosts
+            if hosts:
+                rows = sorted(hosts.items(),
+                              key=lambda kv: -(kv[1]["High"] * 100 + kv[1]["Medium"] * 10 + kv[1]["Low"]))[:5]
+                t = [u"<table width='100%' cellspacing='0' cellpadding='4'>"
+                     u"<tr bgcolor='{0}'><td><b>Host</b></td>"
+                     u"<td align='center'><font color='{1}'><b>High</b></font></td>"
+                     u"<td align='center'><font color='{2}'><b>Med</b></font></td>"
+                     u"<td align='center'><font color='{3}'><b>Low</b></font></td>"
+                     u"<td align='center'><b>Total</b></td></tr>".format(
+                         head_bg, SEVC["High"], SEVC["Medium"], SEVC["Low"])]
+                for host, d in rows:
+                    tt = d["High"] + d["Medium"] + d["Low"] + d["Information"]
+                    t.append(u"<tr><td><font size='3'>{0}</font></td>"
+                             u"<td align='center'>{1}</td><td align='center'>{2}</td>"
+                             u"<td align='center'>{3}</td><td align='center'><b>{4}</b></td></tr>".format(
+                                 esc(host), d["High"], d["Medium"], d["Low"], tt))
+                t.append(u"</table>")
+                H.append(card("Top Affected Hosts", u"".join(t)))
+
+            # footer: memory + disclaimer
+            foot = (u"<font size='3'>Cross-Scan Memory: <b>{0}</b> false positive(s), "
+                    u"<b>{1}</b> confirmed <font color='{2}'>(persisted per host)</font>."
+                    u"</font>".format(mem_fp, mem_cf, muted))
+            if tok > 0:
+                foot += (u"<br><font size='2' color='{0}'>Tokens this session: {1} "
+                         u"({2} calls; last {3}).</font>".format(
+                             muted, num(tok), usage.get("calls", 0), num(usage.get("last_total", 0))))
+            foot += (u"<br><font size='2' color='{0}'><i>Passive tool — AI Hunt candidates "
+                     u"are POTENTIAL until validated.</i></font>".format(muted))
+            H.append(card("Memory & Session", foot))
+
+            self._dash_view.setText(u"<html><body>" + u"".join(H) + u"</body></html>")
+            self._dash_view.setCaretPosition(0)
+        except Exception as ex:
+            try:
+                self._dash_view.setText(u"<html><body>Dashboard error: " +
+                                        _html_escape(str(ex)) + u"</body></html>")
+            except Exception:
+                pass
+
     # -- about tab -------------------------------------------------------------
 
     def _build_about(self):
         outer = JPanel(BorderLayout(4, 4))
         outer.setBorder(BorderFactory.createEmptyBorder(8, 10, 8, 10))
 
-        content = JPanel()
+        content = _WidthTrackingPanel()
         content.setLayout(BoxLayout(content, BoxLayout.Y_AXIS))
         content.setBorder(BorderFactory.createEmptyBorder(4, 4, 4, 4))
 
@@ -1241,7 +2540,9 @@ class UI(object):
         _sans_b = Font("SansSerif",  Font.BOLD,  12)
         _big    = Font("SansSerif",  Font.BOLD,  15)
         _orange = Color(0xFF6B35)
-        _grey   = Color(0x555555)
+        # Theme-aware muted colour so notes stay readable on the dark theme
+        # (the old fixed 0x555555 was nearly invisible on dark backgrounds).
+        _grey   = _theme().muted
 
         def _lbl(text, font=_sans, fg=None, top=0, bot=0):
             l = JLabel(text)
@@ -1261,38 +2562,151 @@ class UI(object):
             p.setAlignmentX(0.0)
             return p
 
+        def _wrap(text, indent=6):
+            """A read-only, transparent, word-wrapping paragraph that fills the
+            width (uses the L&F default text colour so it reads on light + dark)."""
+            ta = JTextArea(text)
+            ta.setLineWrap(True)
+            ta.setWrapStyleWord(True)
+            ta.setEditable(False)
+            ta.setOpaque(False)
+            ta.setFocusable(False)
+            ta.setFont(_sans)
+            ta.setBorder(BorderFactory.createEmptyBorder(0, indent, 6, 0))
+            ta.setAlignmentX(0.0)
+            ta.setMaximumSize(Dimension(32767, 32767))
+            return ta
+
         # ---- App header ----
-        content.add(_lbl("AgenticBurp", _big, _orange, top=2, bot=2))
+        content.add(_lbl("VeriHunt", _big, _orange, top=2, bot=2))
         content.add(_lbl("AI-Powered Security Analysis for Burp Suite", _sans_b, _grey))
         content.add(_lbl("Part of the Agentic Web Pentest project  |  Jython 2.7  |  Burp Suite Extension", _sans, _grey, bot=6))
         content.add(_sep())
 
         # ---- About ----
         content.add(_lbl("About", _sans_b, _orange, top=6, bot=2))
-        about_lines = [
-            "AgenticBurp integrates large language models directly into Burp Suite to perform",
-            "automated security analysis on HTTP requests and responses. Findings are structured,",
-            "severity-classified, and registered as native Burp scan issues.",
-            "",
-            "Right-click any request in Proxy/Repeater/Scanner -> AgenticBurp -> Analyze with AI.",
-            "Single or bulk requests are supported. Bulk scans use concurrent workers.",
-        ]
-        for line in about_lines:
-            content.add(_lbl(line if line else " ", _sans))
+        content.add(_wrap(
+            "VeriHunt integrates large language models directly into Burp Suite to "
+            "perform automated security analysis on HTTP requests and responses. Findings "
+            "are structured, severity-classified, and registered as native Burp scan "
+            "issues.\n\n"
+            "Right-click any request in Proxy / Repeater / Scanner -> VeriHunt -> "
+            "Analyze with AI. Single or bulk requests are supported; bulk scans use "
+            "concurrent workers.\n\n"
+            "The AI Hunt tab adds passive parameter hunting with on-demand AI triage. See "
+            "the Features section below for everything the extension does."))
+        content.add(_sep())
+
+        # ---- Features ----
+        content.add(_lbl("Features", _sans_b, _orange, top=6, bot=2))
+
+        def _feat(title, lines):
+            # Orange title + a single wrapping paragraph (fills width, wraps, and
+            # uses the L&F default text colour so it reads on light and dark).
+            content.add(_lbl("  > " + title, _sans_b, _orange, top=8, bot=1))
+            content.add(_wrap(" ".join(lines), indent=14))
+
+        _feat("AI Analysis (Results tab)", [
+            "Right-click a request -> VeriHunt -> Analyze with AI. Single, or BATCH:",
+            "select many in Proxy history to queue them ('Analyze N requests with AI')",
+            "with concurrent workers, live progress, and a Stop button.",
+            "Optional Self-verify second pass downgrades unproven findings to 'Potential'",
+            "and drops refuted ones (anti-hallucination). Re-analysing the same endpoint no",
+            "longer produces duplicate findings -- results are de-duplicated by severity +",
+            "URL + parameter (host-level issues like CORS/CSP/CSRF are merged, distinct",
+            "endpoints/parameters kept). Findings register as native Burp scan issues; view",
+            "Advisory + Analyzed Request/Response, Toggle False Positive, and ask follow-ups",
+            "in the AI Assistant chat.",
+        ])
+
+        _feat("AI Hunt (passive heuristics + enhanced AI triage)", [
+            "HUNT-style scanner: flags suspicious parameters by name/value across 12 vuln",
+            "classes (SQLi, XSS, LFI/Path Traversal, SSRF, IDOR/BOLA, Command Injection,",
+            "SSTI, XXE, Open Redirect, Deserialization, Mass-Assignment, Debug).",
+            "Every user-controllable parameter is surfaced: names/values that match a class",
+            "are flagged as that class; anything else is listed as 'Other Parameter (review)'",
+            "(Information) so a parameterised request is never silently empty (noise tokens",
+            "like CSRF/session/captcha are skipped).",
+            "Passive: tick 'Passive (Proxy)' -> flags params as you browse. Instant & FREE",
+            "-- no payloads, no AI; static assets skipped, runs off the proxy thread so it",
+            "stays light (default OFF). Candidates are POTENTIAL (heuristic, NOT confirmed)",
+            "until you validate them.",
+            "Scan History: passive only sees NEW traffic after it's enabled, so press",
+            "'Scan History' to run the heuristics over Burp's existing Proxy history",
+            "retroactively (honours 'Scope only', skips static assets) -- use it when",
+            "candidates are missing for a target you already browsed.",
+            "Pick a candidate to see why + methodology + the real Request/Response viewer;",
+            "right-click -> Deep Analyze (AI) / Send to Repeater / Send to Intruder / Copy URL.",
+            "Triage (AI) [on-demand]: evidence-grounded -- feeds reflection, SQL-error,",
+            "stack-trace, status and content-type signals to the model, which returns a",
+            "verdict (LIKELY/POSSIBLE/UNLIKELY) + confidence % + cited evidence + tailored",
+            "payloads + next step. Triage Selected or Triage All; grouped per endpoint to",
+            "control token spend.",
+            "Deep Analyze (AI): right-click a candidate to run the FULL Results analysis",
+            "pipeline (deep AI + self-verify) on that exact request -- heuristic -> deep dive.",
+            "AI Discover: proposes issues the parameter heuristics MISS (access control,",
+            "business logic, sensitive data, headers) from the endpoint -- rows tagged 'AI:'.",
+            "Selecting a candidate shows an Evidence excerpt: the parameter highlighted in",
+            "the request and, if reflected, the value highlighted in the response.",
+        ])
+
+        _feat("Reports & Export", [
+            "Export JSON (all findings, machine-readable). Export Report -> HTML (styled,",
+            "self-contained, printable) or Markdown -- grouped by severity with PoC +",
+            "remediation, false-positives listed separately. Right-click a finding ->",
+            "Copy as Markdown to paste into a ticket or report.",
+        ])
+
+        _feat("Cross-Scan Memory", [
+            "Remembers, per host, the findings you mark False Positive and the ones the AI",
+            "confirmed -- persisted across restarts. On later analyses of the same host it",
+            "feeds this to the model (skip known FPs, stay aware of prior confirmations) and",
+            "auto-drops findings you already dismissed. Toggle with 'Memory' in Settings;",
+            "'Clear Memory' resets it.",
+        ])
+
+        _feat("Dashboard & Demo Mode", [
+            "Dashboard tab: findings by severity, AI Hunt candidates by status + class,",
+            "cross-scan memory and token totals -- refreshes when you open it.",
+            "Load Demo (Results header): loads sample findings + AI Hunt candidates with",
+            "no API/internet, to showcase the full workflow (great for a live demo).",
+        ])
+
+        _feat("Token Usage Tracker", [
+            "The Results header shows tokens for the last call + the running session total",
+            "and call count (from each provider's reported usage) -- useful for TPM-limited",
+            "free tiers (e.g. Groq) and paid quotas. Resets on Clear All.",
+        ])
+
+        _feat("Providers, Models & Theme", [
+            "12 providers (listed below), each with API key, model, base URL, max tokens and",
+            "sampling controls, plus 'Test & Detect Models' to pull the live model list.",
+            "Model IDs are current defaults but editable. Theme: Auto / Light / Dark",
+            "(top of the Settings tab), applied live across all tabs.",
+        ])
         content.add(_sep())
 
         # ---- Providers ----
         content.add(_lbl("Supported Providers", _sans_b, _orange, top=6, bot=2))
-        content.add(_lbl("  Anthropic   --  Claude models (Sonnet, Opus, Haiku)", _mono))
-        content.add(_lbl("  OpenAI      --  GPT-4o, o1, o3 models", _mono))
+        content.add(_lbl("  Anthropic   --  Claude 5 family (Sonnet 5, Opus 5, Haiku 4.5, Fable 5.1)", _mono))
+        content.add(_lbl("  OpenAI      --  GPT-5.x, GPT-4.1/4o, o3/o4-mini", _mono))
         content.add(_lbl("  OpenRouter  --  400+ models via unified API (free & paid)", _mono))
-        content.add(_lbl("  Gemini      --  Google Gemini 2.0/2.5/1.5 models", _mono))
+        content.add(_lbl("  Gemini      --  Google Gemini 3.x / 2.5 (pro, flash, flash-lite)", _mono))
         content.add(_lbl("  Ollama      --  Any local model (qwen, llama, mistral, deepseek)", _mono))
-        content.add(_lbl("  DeepSeek    --  deepseek-chat (V3), deepseek-reasoner (R1)", _mono))
-        content.add(_lbl("  Kimi        --  Moonshot moonshot-v1-8k/32k/128k, kimi-k2", _mono))
-        content.add(_lbl("  Mistral     --  mistral-large / small, codestral", _mono))
-        content.add(_lbl("  Groq        --  llama-3.3 / 3.1 at very fast inference speed", _mono))
-        content.add(_lbl("  xAI (Grok)  --  grok-2, grok-2-vision, grok-beta", _mono))
+        content.add(_lbl("  DeepSeek    --  deepseek-chat (V-series), deepseek-reasoner", _mono))
+        content.add(_lbl("  Kimi        --  Moonshot kimi-latest / kimi-k2 / moonshot-v1-*", _mono))
+        content.add(_lbl("  Mistral     --  mistral-large / medium / small, codestral", _mono))
+        content.add(_lbl("  Groq        --  llama-3.3/4, gpt-oss, kimi-k2 (very fast inference)", _mono))
+        content.add(_lbl("  xAI (Grok)  --  grok-4.6 / 4.5 / 4.3", _mono))
+        content.add(_lbl("  OpenCode Zen--  gateway (claude-sonnet-5, gpt-5.1, kimi-k3, ...)", _mono))
+        content.add(_lbl("  Z.AI (GLM)  --  glm-4.6 (flagship) / glm-4.5 / -air / -flash", _mono))
+        content.add(_lbl("  Z.AI Coding Plan --  SAME models; use this entry for GLM Coding", _mono))
+        content.add(_lbl("                  Plan keys (endpoint .../api/coding/paas/v4)", _mono))
+        content.add(_lbl("  Custom      --  your OpenAI-compatible gateway (LiteLLM, Azure,", _mono))
+        content.add(_lbl("                  private proxy): set Base URL + Model + key", _mono))
+        content.add(_lbl("  Every provider's Base URL is editable -- point VeriHunt at an", _sans, _grey, top=2))
+        content.add(_lbl("  internal LLM gateway without code changes. Model IDs move fast --", _sans, _grey))
+        content.add(_lbl("  use 'Test & Detect Models' for the live list.", _sans, _grey))
         content.add(_sep())
 
         # ---- Model reference table ----
@@ -1300,31 +2714,30 @@ class UI(object):
 
         sections = [
             ("Anthropic", [
-                ("  claude-sonnet-4-6      ", "out: 64k ", "ctx: 200k", "Best balance speed + quality  [Recommended]"),
-                ("  claude-opus-4-6        ", "out: 32k ", "ctx: 200k", "Highest accuracy, slower"),
-                ("  claude-haiku-4-5       ", "out: 16k ", "ctx: 200k", "Fastest, lowest cost"),
-                ("  claude-3-5-sonnet      ", "out:  8k ", "ctx: 200k", "Previous gen, still strong"),
-                ("  claude-3-5-haiku       ", "out:  8k ", "ctx: 200k", "Previous gen fast/cheap"),
+                ("  claude-sonnet-5          ", "out: 64k ", "ctx: 200k", "Best balance speed + quality  [Recommended]"),
+                ("  claude-opus-5            ", "out: 32k ", "ctx: 200k", "Highest accuracy, slower"),
+                ("  claude-haiku-4-5         ", "out: 16k ", "ctx: 200k", "Fastest, lowest cost"),
+                ("  claude-fable-5-1         ", "out: varies", "ctx: 200k", "Lightweight Claude 5"),
+                ("  claude-opus-4-8          ", "out: 32k ", "ctx: 200k", "Previous flagship, still strong"),
             ]),
             ("OpenAI", [
-                ("  gpt-4o                 ", "out: 16k ", "ctx: 128k", "Best balance speed + quality  [Recommended]"),
-                ("  gpt-4o-mini            ", "out: 16k ", "ctx: 128k", "Cheapest, fast, good for bulk"),
-                ("  gpt-4-turbo            ", "out:  4k ", "ctx: 128k", "Strong reasoning, higher cost"),
-                ("  o1                     ", "out: 32k ", "ctx: 200k", "Deep reasoning, very slow"),
-                ("  o1-mini                ", "out: 65k ", "ctx: 128k", "Faster reasoning model"),
-                ("  o3-mini                ", "out: 100k", "ctx: 200k", "Latest reasoning, efficient"),
+                ("  gpt-5.1                  ", "out: varies", "ctx: 400k", "Latest general model  [Recommended]"),
+                ("  gpt-5                    ", "out: varies", "ctx: 400k", "GPT-5 base"),
+                ("  gpt-5-mini               ", "out: varies", "ctx: 400k", "Cheaper, fast, good for bulk"),
+                ("  gpt-4.1                  ", "out: 32k ", "ctx:   1M", "Large-context general model"),
+                ("  gpt-4o                   ", "out: 16k ", "ctx: 128k", "Previous gen, cost-effective"),
+                ("  o3 / o4-mini             ", "out: varies", "ctx: 200k", "Reasoning models"),
             ]),
             ("OpenRouter", [
-                ("  Free models (llama/gemma/deepseek)", "out: varies", "ctx: varies", "Check model page on openrouter.ai/models"),
+                ("  Free models (append :free)        ", "out: varies", "ctx: varies", "Check model page on openrouter.ai/models"),
                 ("  Paid models (claude/gpt/gemini)   ", "out: varies", "ctx: varies", "Same limits as direct provider"),
             ]),
             ("Gemini", [
-                ("  gemini-2.5-pro         ", "out: 65k ", "ctx:   1M", "Best quality, free tier available"),
-                ("  gemini-2.0-flash       ", "out:  8k ", "ctx:   1M", "Fast, free tier  [Recommended]"),
-                ("  gemini-2.0-flash-lite  ", "out:  8k ", "ctx:   1M", "Lightest, cheapest"),
-                ("  gemini-1.5-pro         ", "out:  8k ", "ctx:   2M", "Largest context window"),
-                ("  gemini-1.5-flash       ", "out:  8k ", "ctx:   1M", "Balanced, free tier"),
-                ("  gemini-1.5-flash-8b    ", "out:  8k ", "ctx:   1M", "Fastest, very low cost"),
+                ("  gemini-2.5-flash         ", "out:  8k ", "ctx:   1M", "Fast, free tier  [Recommended]"),
+                ("  gemini-2.5-pro           ", "out: 65k ", "ctx:   1M", "Best 2.5 quality"),
+                ("  gemini-2.5-flash-lite    ", "out:  8k ", "ctx:   1M", "Lightest, cheapest"),
+                ("  gemini-3-flash-preview   ", "out: varies", "ctx:   1M", "Gemini 3 fast (preview)"),
+                ("  gemini-3.1-pro-preview   ", "out: varies", "ctx:   1M", "Gemini 3 flagship (preview)"),
             ]),
             ("Ollama (local)", [
                 ("  qwen2.5-coder:7b       ", "~4GB RAM ", "ctx:  4k ", "Best for code/vuln analysis  [Recommended]"),
@@ -1339,24 +2752,33 @@ class UI(object):
                 ("  deepseek-reasoner      ", "out:  8k ", "ctx:  64k", "R1, chain-of-thought reasoning"),
             ]),
             ("Kimi (Moonshot)", [
-                ("  moonshot-v1-8k         ", "out:  8k ", "ctx:   8k", "Fast, low cost  [Recommended]"),
-                ("  moonshot-v1-32k        ", "out:  8k ", "ctx:  32k", "Medium context"),
-                ("  moonshot-v1-128k       ", "out:  8k ", "ctx: 128k", "Largest context"),
-                ("  kimi-k2-0711-preview   ", "out: varies", "ctx: 128k", "Latest Kimi K2 (check console)"),
+                ("  kimi-latest            ", "out: varies", "ctx: 256k", "Auto-latest Kimi  [Recommended]"),
+                ("  kimi-k2-0905-preview   ", "out: varies", "ctx: 256k", "Kimi K2 (strong agentic)"),
+                ("  moonshot-v1-128k       ", "out:  8k ", "ctx: 128k", "Legacy large context"),
+                ("  moonshot-v1-8k / -32k  ", "out:  8k ", "ctx: 8k/32k", "Legacy smaller contexts"),
             ]),
             ("Mistral", [
                 ("  mistral-large-latest   ", "out:  8k ", "ctx: 128k", "Best quality  [Recommended]"),
-                ("  mistral-small-latest   ", "out:  8k ", "ctx:  32k", "Fast, cheaper"),
-                ("  codestral-latest       ", "out:  8k ", "ctx:  32k", "Code-specialised"),
+                ("  mistral-medium-latest  ", "out:  8k ", "ctx: 128k", "Balanced quality/cost"),
+                ("  mistral-small-latest   ", "out:  8k ", "ctx: 128k", "Fast, cheaper"),
+                ("  codestral-latest       ", "out:  8k ", "ctx: 256k", "Code-specialised"),
             ]),
             ("Groq", [
                 ("  llama-3.3-70b-versatile", "out:  8k ", "ctx: 128k", "Very fast inference  [Recommended]"),
                 ("  llama-3.1-8b-instant   ", "out:  8k ", "ctx: 128k", "Fastest, good for bulk"),
+                ("  openai/gpt-oss-120b    ", "out: varies", "ctx: 128k", "Open-weight, on Groq"),
+                ("  moonshotai/kimi-k2-instruct", "out: varies", "ctx: 256k", "Kimi K2 on Groq"),
             ]),
             ("xAI (Grok)", [
-                ("  grok-2-latest          ", "out:  8k ", "ctx: 128k", "General purpose  [Recommended]"),
-                ("  grok-2-vision-latest   ", "out:  8k ", "ctx:  32k", "Multimodal"),
-                ("  grok-beta              ", "out:  8k ", "ctx: 128k", "Preview model"),
+                ("  grok-4.6               ", "out: varies", "ctx: 256k", "Latest flagship  [Recommended]"),
+                ("  grok-4.5               ", "out: varies", "ctx: 256k", "Previous flagship"),
+                ("  grok-4.3               ", "out: varies", "ctx: 256k", "Extended-context variant"),
+            ]),
+            ("Z.AI (GLM)", [
+                ("  glm-4.6                ", "out: 128k", "ctx: 200k", "Flagship; strong agentic/coding  [Recommended]"),
+                ("  glm-4.5                ", "out:  96k", "ctx: 128k", "Previous flagship"),
+                ("  glm-4.5-air            ", "out:  96k", "ctx: 128k", "Lighter, faster, cheaper"),
+                ("  glm-4.5-flash          ", "out:  96k", "ctx: 128k", "Free tier; good for bulk scans"),
             ]),
         ]
 
@@ -1378,14 +2800,14 @@ class UI(object):
 
         tok_sections = [
             ("Anthropic", [
-                ("  claude-sonnet-4-6  ", "4096-8192", "3-5", "Best quality; handles large responses"),
-                ("  claude-opus-4-6    ", "4096-8192", "2-3", "Slower; lower concurrent to avoid timeout"),
+                ("  claude-sonnet-5    ", "4096-8192", "3-5", "Best quality; handles large responses"),
+                ("  claude-opus-5      ", "4096-8192", "2-3", "Slower; lower concurrent to avoid timeout"),
                 ("  claude-haiku-4-5   ", "2048-4096", "5-8", "High concurrency OK, very fast"),
             ]),
             ("OpenAI", [
-                ("  gpt-4o             ", "4096-8192", "3-5", "Balanced speed + quality"),
-                ("  gpt-4o-mini        ", "4096-8192", "5-8", "Best for bulk; cheap + fast"),
-                ("  o1 / o3-mini       ", "4096",      "1-2", "Very slow; reasoning tokens billed extra"),
+                ("  gpt-5.1            ", "4096-8192", "3-5", "Balanced speed + quality"),
+                ("  gpt-5-mini         ", "4096-8192", "5-8", "Best for bulk; cheap + fast"),
+                ("  o3 / o4-mini       ", "4096",      "1-2", "Slow; reasoning tokens billed extra"),
             ]),
             ("OpenRouter", [
                 ("  Free models        ", "<=2048",    "1-2", "Hard cap; >2048 causes Error 402"),
@@ -1393,9 +2815,8 @@ class UI(object):
             ]),
             ("Gemini", [
                 ("  gemini-2.5-pro     ", "4096-8192", "3-5", "Free: 15 req/min; paid: 360 req/min"),
-                ("  gemini-2.0-flash   ", "2048-4096", "3-5", "Free: 15 req/min"),
-                ("  gemini-1.5-pro     ", "2048-4096", "2-3", "2M ctx but stricter rate limit"),
-                ("  gemini-flash-8b    ", "2048",      "5-8", "Very fast, low cost, lower quality"),
+                ("  gemini-2.5-flash   ", "2048-4096", "3-5", "Fast; generous free tier"),
+                ("  gemini-3.1-pro-preview", "4096-8192", "2-3", "Newest; preview rate limits"),
             ]),
             ("Ollama (local)", [
                 ("  qwen2.5-coder:7b   ", "<=2048",    "1",   "Single thread; GPU bottleneck"),
@@ -1407,19 +2828,23 @@ class UI(object):
                 ("  deepseek-reasoner  ", "4096",      "1-2", "Slow; reasoning tokens billed extra"),
             ]),
             ("Kimi / Moonshot", [
-                ("  moonshot-v1-8k     ", "2048-4096", "3-5", "Fast, low cost"),
-                ("  moonshot-v1-128k   ", "2048-4096", "2-3", "Large ctx; higher latency"),
+                ("  kimi-latest        ", "2048-4096", "3-5", "Auto-latest Kimi"),
+                ("  kimi-k2-0905-preview", "2048-4096", "2-3", "Strong agentic; higher latency"),
             ]),
             ("Mistral", [
-                ("  mistral-large      ", "4096-8192", "3-5", "Strong general reasoning"),
-                ("  mistral-small      ", "4096",      "5-8", "Cheap + fast for bulk"),
+                ("  mistral-large-latest", "4096-8192", "3-5", "Strong general reasoning"),
+                ("  mistral-small-latest", "4096",      "5-8", "Cheap + fast for bulk"),
             ]),
             ("Groq", [
                 ("  llama-3.3-70b      ", "4096-8192", "5-8", "Extremely fast; high concurrency OK"),
                 ("  llama-3.1-8b       ", "4096",      "8-10","Fastest; best for bulk scans"),
             ]),
             ("xAI (Grok)", [
-                ("  grok-2-latest      ", "4096-8192", "3-5", "General purpose"),
+                ("  grok-4.6           ", "4096-8192", "3-5", "General purpose flagship"),
+            ]),
+            ("Z.AI (GLM)", [
+                ("  glm-4.6            ", "4096-8192", "3-5", "Flagship; great for deep analysis"),
+                ("  glm-4.5-flash      ", "<=4096",     "5-8", "Free tier; fast for bulk scans"),
             ]),
         ]
 
@@ -1447,12 +2872,12 @@ class UI(object):
         content.add(_lbl("  Kimi/Moonshot key : platform.moonshot.ai", _mono))
         content.add(_lbl("  Mistral key       : console.mistral.ai", _mono))
         content.add(_lbl("  Groq key          : console.groq.com/keys", _mono))
-        content.add(_lbl("  xAI (Grok) key    : console.x.ai", _mono, bot=6))
+        content.add(_lbl("  xAI (Grok) key    : console.x.ai", _mono))
+        content.add(_lbl("  Z.AI (GLM) key    : z.ai  (open.bigmodel.cn for mainland)", _mono, bot=6))
 
-        # Wrap in scroll
-        wrap = JPanel(BorderLayout())
-        wrap.add(content, BorderLayout.NORTH)
-        scroll = JScrollPane(wrap)
+        # content is a width-tracking Scrollable, so use it as the scroll view
+        # directly -- this makes paragraphs fill and wrap to the panel width.
+        scroll = JScrollPane(content)
         scroll.getVerticalScrollBar().setUnitIncrement(16)
         scroll.setBorder(None)
         outer.add(scroll, BorderLayout.CENTER)
@@ -1469,6 +2894,41 @@ class UI(object):
         btn.setBorderPainted(False)
         btn.setFocusPainted(False)
         return btn
+
+    def _skin_btn(self, btn, role):
+        """Solid-fill button whose colours track the active theme. Registered so
+        _apply_theme_now() re-skins it live when the user flips Light/Dark."""
+        bg, fg = _btn_colors(role)
+        self._style_btn(btn, bg, fg)
+        if not hasattr(self, "_themed_btns"):
+            self._themed_btns = []
+        self._themed_btns.append(("fill", btn, role))
+        return btn
+
+    def _skin_link_btn(self, btn, kind):
+        """Borderless text button (keeps the L&F chrome) with a theme-aware text
+        colour, also registered for live re-skinning."""
+        btn.setForeground(_link_color(kind))
+        if not hasattr(self, "_themed_btns"):
+            self._themed_btns = []
+        self._themed_btns.append(("link", btn, kind))
+        return btn
+
+    def _reskin_buttons(self):
+        """Re-apply theme-aware colours to every registered button. Called from
+        _apply_theme_now so buttons don't keep stale colours after a theme switch."""
+        for entry in getattr(self, "_themed_btns", []):
+            try:
+                kind, btn, role = entry
+                if kind == "fill":
+                    bg, fg = _btn_colors(role)
+                    btn.setBackground(bg)
+                    btn.setForeground(fg)
+                else:
+                    btn.setForeground(_link_color(role))
+                btn.repaint()
+            except Exception:
+                pass
 
     # -- getters for Scanner ---------------------------------------------------
 
@@ -1490,11 +2950,12 @@ class UI(object):
             "ollama_api_key":   self._ollama_key.getText(),
             "ollama_model":     self._ollama_model.getText(),
         }
-        # OpenAI-compatible providers: expose <prefix>_key and <prefix>_model,
-        # matching the keys call_api() reads via _settings_key().
-        for key_prefix, (key_f, model_f, _s) in self._oai_fields.items():
+        # OpenAI-compatible providers: expose <prefix>_key, <prefix>_model and
+        # <prefix>_base, matching the keys call_api() reads via _settings_key().
+        for key_prefix, (key_f, model_f, _s, base_f) in self._oai_fields.items():
             base["{0}_key".format(key_prefix)]   = key_f.getText()
             base["{0}_model".format(key_prefix)] = model_f.getText()
+            base["{0}_base".format(key_prefix)]  = base_f.getText().strip()
         return base
 
     def get_max_tokens(self):
@@ -1516,6 +2977,25 @@ class UI(object):
         except Exception:
             return False
 
+    def get_use_memory(self):
+        try:
+            return self._memory_chk.isSelected()
+        except Exception:
+            return True
+
+    def _clear_memory(self):
+        scanner = getattr(self, "_scanner", None)
+        if scanner is None or not hasattr(scanner, "memory"):
+            self._status_lbl.setText("Memory not available.")
+            return
+        try:
+            fp, cf = scanner.memory.stats()
+            scanner.memory.clear()
+            self._status_lbl.setText(
+                "Cross-scan memory cleared ({0} FP, {1} confirmed removed).".format(fp, cf))
+        except Exception as ex:
+            self._status_lbl.setText("Clear memory failed: " + str(ex))
+
     def get_scope_only(self):
         return self._scope_only_chk.isSelected()
 
@@ -1528,7 +3008,9 @@ class UI(object):
         """Called when a bulk scan begins. total = number of requests queued."""
         self._cancelled     = False
         self._pending_count = total
+        self._queue_total   = total
         self._stop_btn.setEnabled(True)
+        self._status_lbl.setText("Batch analysis: {0} request(s) queued...".format(total))
         self._update_queue_lbl()
 
     def decrement_queue(self):
@@ -1537,12 +3019,20 @@ class UI(object):
         if self._pending_count == 0:
             if not self._placeholders:
                 self._stop_btn.setEnabled(False)
+            total = getattr(self, "_queue_total", 0)
             self._queue_lbl.setText("")
+            if total > 1:
+                self._status_lbl.setText("Batch complete: {0} request(s) analyzed.".format(total))
         else:
             self._update_queue_lbl()
 
     def _update_queue_lbl(self):
-        if self._pending_count > 0:
+        total = getattr(self, "_queue_total", 0)
+        if self._pending_count > 0 and total > 0:
+            done = max(0, total - self._pending_count)
+            self._queue_lbl.setText(
+                "| Analyzing {0}/{1}  ({2} pending)".format(done, total, self._pending_count))
+        elif self._pending_count > 0:
             self._queue_lbl.setText("| Queue: {0} pending".format(self._pending_count))
 
     def _stop_analysis(self):
@@ -1554,6 +3044,35 @@ class UI(object):
 
     def is_cancelled(self):
         return self._cancelled
+
+    def _finding_records(self):
+        """Extract every finding as a plain dict (shared by JSON + report export)."""
+        records = []
+        for key, issue in self._all_findings.items():
+            if issue is None:
+                continue
+            records.append({
+                "name":       issue.getIssueName(),
+                "severity":   issue.getSeverity(),
+                "confidence": issue.getConfidence(),
+                "false_positive": key.startswith("[FP]"),
+                "url":        str(issue.getUrl()),
+                "cvss":       issue.getCvssScore() if hasattr(issue, "getCvssScore") else "",
+                "cve":        issue.getCve()       if hasattr(issue, "getCve")       else "",
+                "parameter":  issue.getParameter() if hasattr(issue, "getParameter") else "",
+                "detail":     issue.getDetailMarkdown()     if hasattr(issue, "getDetailMarkdown")     else "",
+                "background": issue.getBackgroundMarkdown() if hasattr(issue, "getBackgroundMarkdown") else "",
+                "remediation":issue.getRemediationMarkdown() if hasattr(issue, "getRemediationMarkdown") else "",
+            })
+        return records
+
+    def _report_meta(self):
+        import time
+        return {
+            "tool": "VeriHunt",
+            "version": "1.6.0",
+            "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
     def _export_json(self):
         """Export all current findings to a JSON file chosen by the user."""
@@ -1573,27 +3092,8 @@ class UI(object):
             if not path.endswith(".json"):
                 path += ".json"
 
-            records = []
-            active = 0
-            for key, issue in self._all_findings.items():
-                if issue is None:
-                    continue
-                is_fp = key.startswith("[FP]")
-                if not is_fp:
-                    active += 1
-                records.append({
-                    "name":       issue.getIssueName(),
-                    "severity":   issue.getSeverity(),
-                    "confidence": issue.getConfidence(),
-                    "false_positive": is_fp,
-                    "url":        str(issue.getUrl()),
-                    "cvss":       issue.getCvssScore() if hasattr(issue, "getCvssScore") else "",
-                    "cve":        issue.getCve()       if hasattr(issue, "getCve")       else "",
-                    "parameter":  issue.getParameter() if hasattr(issue, "getParameter") else "",
-                    "detail":     issue.getDetailMarkdown()     if hasattr(issue, "getDetailMarkdown")     else "",
-                    "background": issue.getBackgroundMarkdown() if hasattr(issue, "getBackgroundMarkdown") else "",
-                    "remediation":issue.getRemediationMarkdown() if hasattr(issue, "getRemediationMarkdown") else "",
-                })
+            records = self._finding_records()
+            active = sum(1 for r in records if not r["false_positive"])
 
             with open(path, "w") as f:
                 json.dump({"findings": records,
@@ -1608,6 +3108,76 @@ class UI(object):
         except Exception as ex:
             self._status_lbl.setText("Export failed: " + str(ex))
             self._log("Export error: " + str(ex))
+
+    def _export_report(self, fmt):
+        """Export all findings as a professional report. fmt is 'html' or 'md'."""
+        if not self._all_findings:
+            self._status_lbl.setText("No findings to export.")
+            return
+        try:
+            ext  = ".html" if fmt == "html" else ".md"
+            label = "HTML" if fmt == "html" else "Markdown"
+            chooser = JFileChooser()
+            chooser.setDialogTitle("Export {0} Report".format(label))
+            chooser.setSelectedFile(
+                __import__("java.io", fromlist=["File"]).File("agenticburp_report" + ext))
+            ret = chooser.showSaveDialog(None)
+            if ret != JFileChooser.APPROVE_OPTION:
+                return
+
+            path = chooser.getSelectedFile().getAbsolutePath()
+            if not path.endswith(ext):
+                path += ext
+
+            records = self._finding_records()
+            meta = self._report_meta()
+            content = (_build_html_report(records, meta) if fmt == "html"
+                       else _build_md_report(records, meta))
+
+            # Write UTF-8 explicitly (Jython open() defaults to platform encoding).
+            import codecs
+            with codecs.open(path, "w", "utf-8") as f:
+                f.write(content)
+
+            active = sum(1 for r in records if not r["false_positive"])
+            self._status_lbl.setText("Exported {0} report ({1} finding(s)) to {2}".format(
+                label, active, path))
+            self._log("Exported {0} report to {1}".format(label, path))
+
+        except Exception as ex:
+            self._status_lbl.setText("Report export failed: " + str(ex))
+            self._log("Report export error: " + str(ex))
+
+    def _copy_finding_markdown(self):
+        """Copy the currently selected finding to the clipboard as Markdown."""
+        try:
+            key = self._result_list.getSelectedValue()
+            if not key or key not in self._all_findings:
+                self._status_lbl.setText("Select a finding first.")
+                return
+            issue = self._all_findings[key]
+            if issue is None:
+                return
+            rec = {
+                "name": issue.getIssueName(), "severity": issue.getSeverity(),
+                "confidence": issue.getConfidence(), "false_positive": key.startswith("[FP]"),
+                "url": str(issue.getUrl()),
+                "cvss": issue.getCvssScore() if hasattr(issue, "getCvssScore") else "",
+                "cve": issue.getCve() if hasattr(issue, "getCve") else "",
+                "parameter": issue.getParameter() if hasattr(issue, "getParameter") else "",
+                "detail": issue.getDetailMarkdown() if hasattr(issue, "getDetailMarkdown") else "",
+                "background": issue.getBackgroundMarkdown() if hasattr(issue, "getBackgroundMarkdown") else "",
+                "remediation": issue.getRemediationMarkdown() if hasattr(issue, "getRemediationMarkdown") else "",
+            }
+            md = _finding_to_md(rec, heading="##")
+            from java.awt import Toolkit
+            from java.awt.datatransfer import StringSelection
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                StringSelection(md), None)
+            self._status_lbl.setText("Copied finding as Markdown.")
+        except Exception as ex:
+            self._status_lbl.setText("Copy failed: " + str(ex))
+            self._log("Copy markdown error: " + str(ex))
 
     # -- filter helpers --------------------------------------------------------
 
@@ -1737,6 +3307,19 @@ class UI(object):
             _apply_html_theme(self._chat_view, is_chat=True)
         except Exception:
             pass
+        try:
+            _apply_html_theme(self._hunt_detail, is_chat=False)
+            self._hunt_on_select()   # re-render detail with the new palette
+            self._skin_hunt_banner()  # re-colour the POTENTIAL banner for the new theme
+            self._hunt_table.repaint()  # re-run cell renderer (Status/Severity colours)
+        except Exception:
+            pass
+        # Dashboard: re-skin its editor pane (kit + background) and re-render so it
+        # follows the new theme instead of keeping a stale dark/black background.
+        try:
+            self._refresh_dashboard()
+        except Exception:
+            pass
         # Re-render content so the new palette actually paints. setEditorKit reset
         # the document to empty, so an unselected advisory MUST be re-set to a themed
         # empty body — otherwise the stale (old-theme) background stays on screen.
@@ -1762,6 +3345,8 @@ class UI(object):
                 _c.revalidate(); _c.repaint()
             except Exception:
                 pass
+        # Re-colour every registered button for the new theme.
+        self._reskin_buttons()
         self._log("Theme applied: {0}".format(_THEME_MODE))
 
     def _update_summary(self):
@@ -1830,6 +3415,40 @@ class UI(object):
         self._refresh_model_label()
         return key
 
+    def _is_cross_dup(self, issue):
+        """True if an equivalent finding is already stored from a previous analysis
+        (matched on severity + normalized URL + parameter + equal/subset name). Also
+        matches findings the user dismissed as FP, so a re-scan won't resurrect them."""
+        try:
+            sev   = issue.getSeverity()
+            url   = _norm_finding_url(issue.getUrl())
+            name  = issue.getIssueName()
+            try:
+                param = (issue.getParameter() or u"").strip().lower()
+            except Exception:
+                param = u""
+        except Exception:
+            return False
+        for other in self._all_findings.values():
+            if other is None:
+                continue
+            try:
+                if other.getSeverity() != sev:
+                    continue
+                if _norm_finding_url(other.getUrl()) != url:
+                    continue
+                try:
+                    op = (other.getParameter() or u"").strip().lower()
+                except Exception:
+                    op = u""
+                if op != param:
+                    continue
+                if _names_dup(name, other.getIssueName()):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def update_results(self, placeholder_key, issues):
         """Replace placeholder with completed findings and refresh filtered list."""
         # Remove placeholder
@@ -1841,12 +3460,19 @@ class UI(object):
 
         # Collapse near-duplicate findings within THIS analysis batch: the model
         # often emits e.g. "SQL Injection" and "SQL Injection (SQLi)" for the same
-        # request. Keep the first of each (severity, normalized-name) signature.
+        # request. Key on (severity, normalized-URL, parameter, normalized-name) so a
+        # true near-duplicate collapses, but two genuinely distinct findings of the
+        # same class on DIFFERENT parameters/URLs are both kept.
         batch_seen = set()
         deduped = []
         for issue in issues:
             try:
-                sig = (issue.getSeverity(), _norm_finding_name(issue.getIssueName()))
+                try:
+                    param = (issue.getParameter() or u"").strip().lower()
+                except Exception:
+                    param = u""
+                sig = (issue.getSeverity(), _norm_finding_url(issue.getUrl()), param,
+                       _norm_finding_name(issue.getIssueName()))
             except Exception:
                 sig = None
             if sig is not None and sig in batch_seen:
@@ -1856,8 +3482,16 @@ class UI(object):
                 batch_seen.add(sig)
             deduped.append(issue)
 
-        # Store completed findings (cross-analysis collisions still get a counter)
+        # Store completed findings. Skip a finding already present from a PRIOR run of
+        # the same endpoint (same severity + normalized URL + parameter + equal/subset
+        # name) so re-analyzing a target no longer produces "... (2)" repeats of
+        # host-level issues (CORS / CSP / missing CSRF). Genuinely distinct findings
+        # (different URL, parameter, or class) are still kept and counter-suffixed.
         for issue in deduped:
+            if self._is_cross_dup(issue):
+                self._log("Dedup: dropped cross-analysis duplicate '{0}'".format(
+                    issue.getIssueName()))
+                continue
             sev     = issue.getSeverity()
             name    = issue.getIssueName()
             base    = "[{0}] {1}".format(sev, name)
@@ -1870,9 +3504,55 @@ class UI(object):
 
         # Rebuild visible list (filter applied)
         self._apply_filter()
+        # Refresh the session token counter (the analysis call just recorded usage)
+        self.refresh_token_label()
         # Disable Stop button when all placeholders are resolved (single scan done)
         if not self._placeholders and self._pending_count == 0:
             self._stop_btn.setEnabled(False)
+
+    def refresh_token_label(self):
+        """Update the header token counter from the shared session usage total."""
+        try:
+            u = _get_usage()
+            if not u or u.get("total", 0) <= 0:
+                self._token_lbl.setText("")
+                return
+            def _k(n):
+                return "{0:,}".format(int(n))
+            self._token_lbl.setText(
+                u"Tokens: last {0} · session {1} ({2} calls)".format(
+                    _k(u.get("last_total", 0)), _k(u.get("total", 0)), u.get("calls", 0)))
+        except Exception:
+            pass
+
+    def _load_demo(self):
+        """Populate Results + AI Hunt with bundled sample data (no API/internet)."""
+        try:
+            for d in _demo.DEMO_FINDINGS:
+                issue = _AgenticBurpIssue(
+                    http_service=None, url=d["url"], http_messages=[],
+                    name=d["name"], detail=d["detail"], background=d["background"],
+                    remediation=d["remediation"], severity=d["severity"],
+                    confidence=d["confidence"], cvss_score=d.get("cvss", ""),
+                    parameter=d.get("parameter", ""), cve=d.get("cve", ""))
+                disp = d["confidence"] == "Tentative" and not d["name"].lower().startswith("potential")
+                nm = ("Potential " + d["name"]) if disp else d["name"]
+                key = "[{0}] {1}".format(d["severity"], nm)
+                c = 2
+                while key in self._all_findings:
+                    key = "[{0}] {1} ({2})".format(d["severity"], nm, c); c += 1
+                self._all_findings[key] = issue
+            self._update_summary()
+            self._apply_filter()
+        except Exception as ex:
+            self._log("Demo findings error: " + str(ex))
+        try:
+            self._hunt_add_hits([dict(x) for x in _demo.DEMO_HUNT])
+        except Exception as ex:
+            self._log("Demo hunt error: " + str(ex))
+        self._status_lbl.setText(
+            "Demo data loaded: {0} findings + {1} AI Hunt candidates (see AI Hunt tab).".format(
+                len(_demo.DEMO_FINDINGS), len(_demo.DEMO_HUNT)))
 
     def _clear(self):
         self._list_model.clear()
@@ -1885,6 +3565,12 @@ class UI(object):
         self._resp_editor.setMessage([], False)
         self._stop_btn.setEnabled(False)
         self._queue_lbl.setText("")
+        # Reset the session token counter alongside the findings.
+        try:
+            _reset_usage()
+        except Exception:
+            pass
+        self._token_lbl.setText("")
         self._status_lbl.setText("Cleared.")
 
     def _on_select(self, event):
@@ -1950,10 +3636,26 @@ class UI(object):
         if not key or key not in self._all_findings:
             return
         issue   = self._all_findings[key]
-        new_key = ("[FP] " + key) if not key.startswith("[FP]") else key[5:]
+        becoming_fp = not key.startswith("[FP]")
+        new_key = ("[FP] " + key) if becoming_fp else key[5:]
         del self._all_findings[key]
         self._all_findings[new_key] = issue
         self._apply_filter()
+        # Cross-scan memory: remember (or forget) this as a false positive so
+        # future analyses of the same host skip it.
+        try:
+            scanner = getattr(self, "_scanner", None)
+            if scanner is not None and issue is not None and hasattr(scanner, "memory"):
+                u = issue.getUrl()
+                host = u.getHost() if u else ""
+                path = u.getPath() if u else ""
+                nm = issue.getIssueName()
+                if becoming_fp:
+                    scanner.memory.add_fp(host, path, nm)
+                else:
+                    scanner.memory.remove_fp(host, nm)
+        except Exception:
+            pass
 
     def _delete_item(self, idx):
         if 0 <= idx < self._list_model.getSize():
@@ -2042,12 +3744,15 @@ class UI(object):
                 return
             lst.setSelectedIndex(idx)
             menu     = JPopupMenu()
-            del_item = JMenuItem("Delete")
-            del_item.addActionListener(lambda ev, i=idx: self._ui._delete_item(i))
-            menu.add(del_item)
+            copy_item = JMenuItem("Copy as Markdown")
+            copy_item.addActionListener(lambda ev: self._ui._copy_finding_markdown())
+            menu.add(copy_item)
             fp_item  = JMenuItem("Toggle False Positive")
             fp_item.addActionListener(lambda ev: self._ui._toggle_fp())
             menu.add(fp_item)
+            del_item = JMenuItem("Delete")
+            del_item.addActionListener(lambda ev, i=idx: self._ui._delete_item(i))
+            menu.add(del_item)
             menu.show(e.getComponent(), e.getX(), e.getY())
 
 
@@ -2082,3 +3787,19 @@ class _MessageEditorController(IMessageEditorController):
 
     def getResponse(self):
         return self._response
+
+
+class _WidthTrackingPanel(JPanel, Scrollable):
+    """A BoxLayout panel that fills the scroll viewport's WIDTH (so wrapping
+    JTextAreas inside actually wrap to the available width instead of keeping a
+    narrow preferred width) while scrolling vertically."""
+    def getPreferredScrollableViewportSize(self):
+        return self.getPreferredSize()
+    def getScrollableUnitIncrement(self, visibleRect, orientation, direction):
+        return 16
+    def getScrollableBlockIncrement(self, visibleRect, orientation, direction):
+        return 160
+    def getScrollableTracksViewportWidth(self):
+        return True
+    def getScrollableTracksViewportHeight(self):
+        return False

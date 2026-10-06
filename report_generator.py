@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AgenticBurp - AI-Powered Security Analysis for Burp Suite
+# VeriHunt - AI-Powered Security Analysis for Burp Suite
 # report_generator.py -- Parse AI output into structured Burp issues
 
 import re
@@ -489,7 +489,7 @@ class ReportGenerator(object):
                     http_messages = http_messages,
                     name          = u"No Vulnerabilities Identified",
                     detail        = part,
-                    background    = u"AgenticBurp AI analysis found no vulnerabilities on this request.",
+                    background    = u"VeriHunt AI analysis found no vulnerabilities on this request.",
                     remediation   = (u"No action required for this request. Consider authenticated "
                                      u"testing and JavaScript analysis for fuller coverage."),
                     severity      = u"Information",
@@ -540,6 +540,29 @@ class ReportGenerator(object):
                 part, u"Issue Background", u"Background", u"Technical Background")
             remediation = _extract_section(
                 part, u"Remediation", u"Fix", u"Mitigation")
+
+            # ── Guard: a heading the model mis-marked as a finding ──────────────
+            # Small models sometimes write PoC steps as '#' headings ("Decrypt
+            # with:", "Using sslstrip:", "User visits ... -> intercepts as HTTP.").
+            # A REAL finding heading is a short noun phrase AND carries finding
+            # fields. A heading that ends with ':', embeds a URL/redirect, or is a
+            # long sentence, AND has NO finding fields, is a step belonging to the
+            # PREVIOUS finding -- fold its content back in rather than emitting a
+            # bogus Information finding.
+            _stepish = (name.endswith(u":") or u" -> " in name or u"://" in name
+                        or len(name.split()) > 12)
+            _has_fields = bool(severity_raw or cvss_raw or evidence or scenario
+                               or poc or root_cause or parameter_raw or wstg_raw
+                               or (cve_raw and cve_raw.upper() != u"N/A") or remediation)
+            if _stepish and not _has_fields and issues:
+                # Fold this stray step into the PREVIOUS finding. Only when there is
+                # a previous finding -- otherwise fall through and keep it as a
+                # finding so a lone/first section is never silently dropped.
+                try:
+                    issues[-1].append_detail(u"\n\n" + part)
+                except Exception:
+                    pass
+                continue
 
             # Merge new-format evidence + scenario into detail
             if evidence and not detail:
@@ -599,7 +622,7 @@ class ReportGenerator(object):
                 name          = display_name,
                 detail        = detail,
                 background    = (background if background
-                                 else u"Identified by AgenticBurp AI analysis."),
+                                 else u"Identified by VeriHunt AI analysis."),
                 remediation   = (remediation if remediation
                                  else u"Review and remediate the identified vulnerability."),
                 severity      = severity,
@@ -620,7 +643,7 @@ class ReportGenerator(object):
                 http_messages = http_messages,
                 name          = "AI Analysis Result",
                 detail        = ai_text,
-                background    = "Identified by AgenticBurp AI analysis.",
+                background    = "Identified by VeriHunt AI analysis.",
                 remediation   = "Review the AI analysis and perform manual verification.",
                 severity      = "Information",
                 confidence    = "Tentative",
@@ -628,3 +651,122 @@ class ReportGenerator(object):
             issues.append(issue)
 
         return issues
+
+
+# ── Findings report export (Markdown + self-contained HTML) ────────────────────
+# Consumes plain finding dicts (the same shape ui.py already builds for JSON
+# export) so this stays decoupled from Burp's IScanIssue API.
+
+_REPORT_SEV_RANK = {"High": 0, "Medium": 1, "Low": 2, "Information": 3}
+
+
+def finding_record_to_markdown(rec, heading="##"):
+    """Render one finding dict as a Markdown section."""
+    out = []
+    fp = " *(False Positive)*" if rec.get("false_positive") else ""
+    out.append(u"{0} [{1}] {2}{3}".format(
+        heading, rec.get("severity", "Information"), rec.get("name", "Finding"), fp))
+    meta = [
+        (u"Severity",   rec.get("severity", "")),
+        (u"Confidence", rec.get("confidence", "")),
+        (u"CVSS",       rec.get("cvss", "")),
+        (u"CVE",        rec.get("cve", "")),
+        (u"Parameter",  rec.get("parameter", "")),
+        (u"URL",        rec.get("url", "")),
+    ]
+    for label, val in meta:
+        if val:
+            out.append(u"- **{0}:** {1}".format(label, val))
+    out.append(u"")
+    if rec.get("detail"):
+        out.append(u"### Detail")
+        out.append(rec["detail"].strip())
+        out.append(u"")
+    if rec.get("background"):
+        out.append(u"### Background")
+        out.append(rec["background"].strip())
+        out.append(u"")
+    if rec.get("remediation"):
+        out.append(u"### Remediation")
+        out.append(rec["remediation"].strip())
+        out.append(u"")
+    return u"\n".join(out)
+
+
+def build_markdown_report(records, meta=None):
+    """Assemble a full Markdown report from a list of finding dicts."""
+    meta = meta or {}
+    active = [r for r in records if not r.get("false_positive")]
+    fps    = [r for r in records if r.get("false_positive")]
+    active.sort(key=lambda r: _REPORT_SEV_RANK.get(r.get("severity"), 9))
+
+    tally = {}
+    for r in active:
+        tally[r.get("severity", "Information")] = tally.get(r.get("severity", "Information"), 0) + 1
+
+    lines = []
+    lines.append(u"# {0} — AI Security Analysis Report".format(meta.get("tool", "VeriHunt")))
+    sub = []
+    if meta.get("generated"):
+        sub.append(u"Generated: {0}".format(meta["generated"]))
+    if meta.get("version"):
+        sub.append(u"Version: {0}".format(meta["version"]))
+    sub.append(u"Findings: {0} active, {1} false-positive".format(len(active), len(fps)))
+    lines.append(u"_" + u" · ".join(sub) + u"_")
+    lines.append(u"")
+    lines.append(u"> Passive analysis of provided request/response evidence. "
+                 u"Findings marked *Tentative* were not confirmed with active payloads.")
+    lines.append(u"")
+
+    lines.append(u"## Summary")
+    if tally:
+        for sev in ("High", "Medium", "Low", "Information"):
+            if tally.get(sev):
+                lines.append(u"- **{0}:** {1}".format(sev, tally[sev]))
+    else:
+        lines.append(u"- No active findings.")
+    lines.append(u"")
+    lines.append(u"---")
+    lines.append(u"")
+
+    if active:
+        lines.append(u"## Findings")
+        lines.append(u"")
+        for i, rec in enumerate(active, 1):
+            lines.append(finding_record_to_markdown(rec, heading="###"))
+            lines.append(u"---")
+            lines.append(u"")
+
+    if fps:
+        lines.append(u"## False Positives (excluded)")
+        for rec in fps:
+            lines.append(u"- [{0}] {1} — {2}".format(
+                rec.get("severity", ""), rec.get("name", ""), rec.get("url", "")))
+        lines.append(u"")
+
+    return u"\n".join(lines)
+
+
+def build_html_report(records, meta=None):
+    """Self-contained HTML report — the Markdown report rendered with inline CSS
+    (printable, works offline, no external assets)."""
+    md = build_markdown_report(records, meta)
+    body = _md_to_html(md)
+    title = u"{0} — AI Security Report".format((meta or {}).get("tool", "VeriHunt"))
+    css = (
+        u"body{font-family:-apple-system,Segoe UI,Arial,sans-serif;line-height:1.55;"
+        u"color:#1a1a2e;max-width:920px;margin:32px auto;padding:0 20px;}"
+        u"h1{color:#FF6B35;border-bottom:3px solid #FF6B35;padding-bottom:8px;}"
+        u"h2{color:#37474F;border-bottom:1px solid #e0e0e0;padding-bottom:4px;margin-top:32px;}"
+        u"h3{color:#546E7A;margin-top:24px;}"
+        u"code{background:#f4f4f4;padding:1px 5px;border-radius:3px;font-family:Consolas,Monaco,monospace;font-size:90%;}"
+        u"pre{background:#0d1117;color:#c9d1d9;padding:12px;border-radius:6px;overflow:auto;}"
+        u"pre code{background:transparent;color:inherit;padding:0;}"
+        u"hr{border:none;border-top:1px solid #e0e0e0;margin:24px 0;}"
+        u"blockquote{border-left:4px solid #FF6B35;margin:0;padding:8px 16px;background:#fff8f5;color:#555;}"
+        u"a{color:#1565C0;}"
+    )
+    return (
+        u"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        u"<title>{0}</title><style>{1}</style></head><body>{2}</body></html>"
+    ).format(_html_entity_safe(title), css, body)

@@ -1,4 +1,71 @@
-# AgenticBurp Changelog
+# VeriHunt Changelog
+
+---
+
+## [v1.6.0] — 2026-10-06
+
+### Added
+- **Z.AI (GLM) provider** — a twelfth provider behind the OpenAI-compatible registry: base `https://api.z.ai/api/paas/v4`, default model `glm-4.6` (also `glm-4.5` / `-air` / `-flash (free)` on the standard plan), settings keys `zai_key` / `zai_model`.
+- **Z.AI Coding Plan (GLM) entry** — GLM Coding Plan keys are ONLY valid on the coding endpoint, which the standard Z.AI base rejects; this dedicated entry ships `https://api.z.ai/api/coding/paas/v4` out of the box with its own `zaicoding_key` / `zaicoding_model` settings so a Coding Plan key and a standard key coexist.
+- **Custom (OpenAI-compatible) provider + editable Base URL (enterprise gateways)** — every OpenAI-compatible provider now exposes an editable **Base URL** field (saved per provider, used by Test Connection and analysis), and a built-in **Custom** entry lets enterprises route VeriHunt through an internal LLM gateway — LiteLLM, an Azure OpenAI-compatible surface, or a private proxy — with no code changes. An unset Base URL produces a clear error instead of a malformed request.
+
+### Fixed
+- **Malformed endpoint URL for versioned API bases (broke Z.AI)** — the chat-completions URL builder appended `/v1/chat/completions` to any base not literally ending in `/v1`, so versioned bases like Z.AI's `https://api.z.ai/api/paas/v4` became `.../v4/v1/chat/completions` (404). It is now version-segment aware: a base ending in `/v<N>` gets only `/chat/completions` appended.
+- **Per-provider Base URL override was never wired** — the analysis client supported a saved `{provider}_base` override, but no UI field existed and the setting was never sent, so the override silently never applied. Every OpenAI-compatible provider tab now has a Base URL field that is saved, restored, used by Test Connection, and passed through to analysis.
+
+---
+
+## [v1.5.0] — 2026-09-24
+
+### Changed
+- **Rebranded to VeriHunt** — the tool was renamed (AgenticBurp -> Burp Verdict -> **VeriHunt**) so the product name no longer contains the "Burp" trademark; "for Burp Suite" remains as a descriptive phrase. The load entry point is now **`verihunt.py`** (remove the old extension in Burp and add `verihunt.py`). Internal identifiers and, crucially, the stored-settings keys are unchanged, so your saved API keys and cross-scan memory carry over.
+
+### Added
+- **AI Discover now returns literal, copy-paste payloads** — the on-demand *AI Discover* previously showed the same prose instruction under "AI-tailored payloads", "Methodology" and "Try these". It now asks the model for a ready-to-send payload per finding (a full XML/JSON body, a header line, or a concrete parameter value) tailored to the endpoint, parsed into its own field (multi-line payloads carried as `\n` and restored, multiple payloads split on ` ;; `). The raw model reply is logged to the extension output and a clear status is shown when a model returns nothing parseable, so an empty result is diagnosable instead of silent.
+- **Enterprise Dashboard redesign** — a security-posture header with a weighted **Risk** pill (severity-first: any High => at least HIGH, 3+ High => CRITICAL), a **KPI tile row** (Findings, High/Medium/Low, Confirmed, Potential, AI Hunt, Tokens), side-by-side **Findings-by-Severity** (with counts + percentages) and **AI Hunt Coverage** (triaged %, status chips, top classes) cards, a **Top Affected Hosts** table, and a memory/session footer. Fully theme-aware and rendered with Swing-safe tables.
+
+### Fixed
+- **Dashboard rendered as a black block on the Light theme** — the theme switch never re-skinned the Dashboard editor pane, and a refresh never re-applied the themed stylesheet/background. The Dashboard now re-themes on every refresh and follows a live Light/Dark switch.
+- **AI Hunt triage & discovery prompts now state an authorized/educational engagement context** — matching the main analysis prompt, so safety-tuned models stop refusing to produce test payloads (a common cause of empty AI Discover results).
+- **Dashboard build fixes** — corrected two HTML double-escape defects (the meta line and the footer card title) and made the risk rating severity-first so a single High finding is no longer downgraded to "MEDIUM".
+
+---
+
+## [v1.4.0] — 2026-09-14
+
+### Added
+- **AI Hunt — Scan History** — a new toolbar button that runs the parameter heuristics over Burp's *existing* Proxy history retroactively. Passive scanning only sees traffic that arrives *after* it's enabled, so anything browsed earlier (or with Passive off) was invisible; press *Scan History* to surface candidates for targets you already browsed. Runs off the EDT, honours *Scope only*, skips static assets, and flushes rows in batches so the UI stays responsive on large histories.
+- **AI Hunt — generic catch-all** — every user-controllable parameter is now surfaced. Params whose name/value matches no class are listed as **"Other Parameter (review)"** (Information severity) so a parameterised request is never silently empty; known non-injectable noise tokens (anti-CSRF, session, captcha, cache-busters, submit) are excluded. The class is selectable in the filter dropdown.
+
+### Changed
+- **SQL Injection coverage — login/credential fields** — the SQLi parameter dictionary now includes common login field names (`username`, `uname`, `login`, `email`, `password`, `passwd`, `pwd`, `j_username`, `j_password`, `txtusername`, …) with auth-bypass payloads (`' OR '1'='1'-- -`, `admin'-- -`, `') OR ('1'='1'-- -`, …). Login forms are now flagged as Potential SQLi / auth-bypass candidates.
+
+### Fixed
+- **Results no longer show duplicate findings** — re-analysing the same endpoint previously produced `... (2)` copies of host-level issues (CORS / CSP / missing CSRF), and the model naming the same issue slightly differently across runs (e.g. "Credentialed Wildcard" vs "Credentialed Wildcard Origin") slipped past the old within-batch dedup. Findings are now de-duplicated across analyses by severity + normalized URL + parameter + equal-or-subset name; genuinely distinct findings (different URL, parameter, or class) are still kept. Findings dismissed as False Positive are not resurrected on re-scan.
+- **Self-verify no longer drops "Potential" attack-surface findings** — the second-pass verifier used to discard any finding it couldn't prove in the single passive response, which silently deleted *Potential SQL Injection / Authentication Bypass* (and LFI / SSRF / IDOR inferred from parameters) on login and other endpoints — the tool sends no payloads, so those can never be proven passively. Verification now treats **absence of proof as "Potential" (kept), not false positive**, and only drops confidently-asserted findings the response *actively contradicts*. The analysis prompt also now mandates a *Potential SQL Injection / Authentication Bypass* (Tentative) finding on login/auth endpoints (username + password), with auth-bypass payloads for both fields.
+
+---
+
+## [v1.3.0] — 2026-09-11
+
+### Added
+- **AI Hunt tab** — passive, HUNT-style parameter heuristics across 12 vulnerability classes (SQLi, XSS, LFI/Path Traversal, SSRF, IDOR/BOLA, Command Injection, SSTI, XXE, Open Redirect, Deserialization, Mass-Assignment, Debug). Runs on Proxy traffic when *Passive (Proxy)* is ticked (default off) — instant, free, no payloads; static assets skipped and work is bounded off the proxy thread. Candidates are **POTENTIAL** until validated.
+- **Enhanced AI triage (AI Hunt)** — on-demand *Triage Selected / Triage All*: evidence-grounded (feeds reflection, SQL-error, stack-trace, status and content-type signals) and returns a verdict (LIKELY/POSSIBLE/UNLIKELY) + confidence % + cited evidence + tailored payloads + next step, grouped per endpoint to control token spend.
+- **Deep Analyze (AI)** — right-click an AI Hunt candidate to run the full Results analysis pipeline (deep AI + self-verify) on that exact request.
+- **Request/Response viewer** for AI Hunt candidates (native Burp editors) with right-click *Send to Repeater / Send to Intruder / Copy URL*.
+- **Cross-scan memory** — per-host memory of false positives + AI-confirmed findings, persisted across restarts; fed to the model (skip known FPs, stay aware of prior confirmations) and auto-drops still-unproven known FPs. Settings: *Memory* toggle + *Clear Memory*.
+- **Report export: HTML + Markdown** (grouped by severity, PoC + remediation, false positives listed separately), plus right-click *Copy as Markdown* per finding.
+- **Token usage tracker** — last-call + running session tokens and call count in the Results header (TPM / quota awareness); resets on Clear All.
+- **Batch/queue analysis surfaced** — the context menu shows "Analyze N requests with AI" and the queue shows live "Analyzing X/N" progress.
+- **About tab documentation** — a Features section documenting all capabilities.
+
+### Changed
+- **Model defaults refreshed** to current generations — Anthropic Claude 5 (sonnet-5 / opus-5 / haiku-4-5 / fable-5-1), OpenAI GPT-5.x + GPT-4.1, Google Gemini 2.5 / 3.x, xAI grok-4.x, Kimi kimi-latest, plus current Mistral / Groq / DeepSeek IDs. All model fields are editable and *Test & Detect Models* pulls the live list.
+- **AI Hunt and About made theme-aware** (Light / Dark) with ASCII-only labels to avoid Burp label mojibake; About descriptions now wrap to the panel width.
+
+### Fixed
+- **Report parser no longer splits one finding into junk findings** — PoC-step headings a model wrote as `#` (e.g. "Decrypt with:", "Using sslstrip:") are folded into the parent finding instead of becoming bogus Information findings. The prompt was also hardened to reserve `#` for finding titles only.
+- **AI Hunt robustness** — bounded passive queue (drops when saturated, never blocks the proxy thread), correct UNLIKELY-vs-LIKELY verdict parsing, and a `_hunt_busy` safety net so triage can never get stuck.
 
 ---
 
@@ -28,7 +95,7 @@
 - **Malformed advisory HTML when a list or table followed prose/heading without a blank line** — the block was wrapped as `<p><ul>…</ul></p>` with stray `<br>` before each `<li>`, giving broken/extra-spaced lists (e.g. under `## Remediation`). Paragraph assembly now walks line by line and emits block-level markup as bare siblings; verified across list-after-prose, list-after-heading, table, fenced-code, and inline-code cases.
 - **Redundant double-add of the Results header** — the header panel was added to the container twice, relying on Swing reparenting; removed the no-op add.
 - **Stale version in the UI banner** — the header read `v1.0.0` regardless of the real version; it is now driven by `agenticburp.EXTENSION_VERSION` (single source of truth) and shows `v1.2.0`.
-- **Generic placeholder Background/Remediation** ("Identified by AgenticBurp AI analysis." / "Review and remediate the identified vulnerability.") no longer render in the Advisory when the model gave no dedicated section — they sat next to real, detailed remediation and read as unfinished. Real content is unaffected.
+- **Generic placeholder Background/Remediation** ("Identified by VeriHunt AI analysis." / "Review and remediate the identified vulnerability.") no longer render in the Advisory when the model gave no dedicated section — they sat next to real, detailed remediation and read as unfinished. Real content is unaffected.
 
 ---
 

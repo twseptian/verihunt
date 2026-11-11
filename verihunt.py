@@ -48,7 +48,7 @@ from ui import UI
 from scanner import Scanner
 
 EXTENSION_NAME = "VeriHunt"
-EXTENSION_VERSION = "1.6.0"
+EXTENSION_VERSION = "1.9.0"
 
 
 class BurpExtender(IBurpExtender, IContextMenuFactory, ITab, IHttpListener):
@@ -103,9 +103,19 @@ class BurpExtender(IBurpExtender, IContextMenuFactory, ITab, IHttpListener):
             # extension; respect the "Scope only" setting when enabled.
             try:
                 import hunt_engine as _he
+                import js_engine as _js
                 url = self._helpers.analyzeRequest(message_info).getUrl()
                 if _he.is_static_url(url.toString()):
-                    return
+                    # JS files are skipped like other static assets UNLESS the
+                    # AI Hunt "JS scan" toggle is on — then JS URLs are queued
+                    # for library/secret/sink fingerprinting.
+                    try:
+                        js_ok = (self.ui.get_js_scan()
+                                 and _js.is_js_url(url.toString()))
+                    except Exception:
+                        js_ok = False
+                    if not js_ok:
+                        return
                 if self.ui.get_scope_only() and not self._callbacks.isInScope(url):
                     return
             except Exception:

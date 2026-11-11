@@ -411,6 +411,41 @@ class ReportGenerator(object):
             except Exception:
                 pass
 
+    # Conversational openers/closers that chatty models prepend/append to an
+    # otherwise valid analysis ("Let me analyze...", "Want me to ...?").
+    _CONVO_LINE_RE = re.compile(
+        r"^(?:let me|i'll|i will|i'm going to|sure[,!]?|okay[,!]?|ok[,!]|"
+        r"here(?:'s| is)|based on (?:my|the|this)|alright|certainly|"
+        r"great[,!]|got it|thanks|looking at|analyz(?:ing|e)\b|now[,!]\b)\b.*$",
+        re.I)
+    _CONVO_TAIL_RE = re.compile(
+        r"^(?:want me to|shall i|would you like me|should i)\b.*$", re.I)
+
+    @staticmethod
+    def _strip_conversation(text):
+        """Drop leading narration lines and trailing follow-up questions that
+        chatty models add around the real analysis. Only whole leading/
+        trailing lines are removed and never lines starting with '#' (finding
+        headings), so well-formed responses are untouched."""
+        lines = text.split("\n")
+        while lines:
+            l = lines[0].strip()
+            if not l:
+                lines.pop(0)
+                continue
+            if l.startswith("#") or not ReportGenerator._CONVO_LINE_RE.match(l):
+                break
+            lines.pop(0)
+        while lines:
+            l = lines[-1].strip()
+            if not l:
+                lines.pop()
+                continue
+            if l.startswith("#") or not ReportGenerator._CONVO_TAIL_RE.match(l):
+                break
+            lines.pop()
+        return "\n".join(lines)
+
     def parse_ai_response(self, ai_text, http_service, url, http_messages):
         """
         Parse an AI response that contains multiple # Vulnerability findings.
@@ -431,6 +466,9 @@ class ReportGenerator(object):
 
         # Normalise line endings
         ai_text = ai_text.replace(u"\r\n", u"\n").replace(u"\r", u"\n")
+
+        # Strip chatty narration before parsing (model-dependent behaviour)
+        ai_text = self._strip_conversation(ai_text)
 
         # Robustness: some models ignore the "# heading per finding" instruction
         # and use ## as their top level instead. When there is no single-# heading

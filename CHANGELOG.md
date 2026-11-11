@@ -2,6 +2,42 @@
 
 ---
 
+## [v1.9.0] — 2026-10-27
+
+### Changed
+- **JS scan noise reduction (quiet by default)** — clean library fingerprints, bare DOM-sink presence and per-file endpoint lists no longer flood the AI Hunt table: only CVE-matched libraries (High), secrets (High — with documentation placeholders like `YOUR_API_KEY` filtered), exposed source maps and per-host endpoint disclosures become candidates. JS candidates now deduplicate **per host** instead of per file. All of the underlying detail (libraries + exact versions, sinks, endpoints) still reaches the LLM via the full-file JS digest, where Triage (AI) / AI Discover can turn it into real candidates.
+
+### Added
+- **Automatic CVE matching for fingerprinted JS libraries** — JS Library candidates are no longer just "check this version manually". Every fingerprinted library+version is now automatically matched against **OSV.dev** (querying the exact version against the live GHSA/NVD-backed database — so a CVE published yesterday is covered; traffic goes to `api.osv.dev`, never to the target) with an **embedded offline ruleset** (jQuery, Bootstrap, Lodash, AngularJS, Axios, Moment.js, Underscore, Handlebars, jQuery UI, Socket.IO) as fallback when offline. Matching libraries upgrade from "JS Library Fingerprint" (Medium) to **"JS Library Outdated (CVE)" (High)** with the CVE IDs in the candidate, and known CVEs are also attached to the "Analyze with AI" JS digest. Results are cached per library+version for the session; the OSV query covers all npm-mapped libraries automatically — no manual rule maintenance.
+
+---
+
+## [v1.8.0] — 2026-10-27
+
+### Added
+- **JavaScript analysis (new `JS scan` toggle + full-file LLM digest)** — two gaps closed in one feature:
+  - **Passive JS fingerprinting (AI Hunt)** — a new *JS scan* checkbox (next to *Passive (Proxy)*) makes the passive hunter include `.js` files, which were previously skipped as static assets. A deterministic engine fingerprints frontend libraries **with exact versions** (jQuery, Bootstrap, AngularJS, React, Vue, Lodash, GSAP, DataTables and 25+ more — Retire.js-style), and surfaces candidates: **JS Library Fingerprint** (check the exact version against CVEs), **Secret / Credential in JS** (AWS keys, Google/GitHub/Slack/Stripe tokens, JWTs, private-key blocks, hardcoded `apiKey`/`password` assignments — values masked in the UI), **Source Map Disclosed**, **JS DOM Sink (review)** and **JS Endpoint Disclosure**.
+  - **Full-file JS digest for "Analyze with AI"** — JS responses were previously truncated to the first 2,000 characters in the prompt, so everything after that was invisible to the model. When the analyzed response is JavaScript, a deterministic digest (libraries + exact versions, masked secrets with line numbers, source-map reference, DOM sinks, API endpoints, external URLs) computed over the **entire file** is attached to the prompt — the LLM can now reason about the whole bundle and map detected versions to known CVEs.
+
+---
+
+## [v1.7.0] — 2026-10-27
+
+### Changed
+- **Model defaults refreshed to current generations (research-verified against vendor docs and the live OpenRouter catalog, 464 models)** — Anthropic: **Claude 5.5 trio** (`claude-sonnet-5-5` recommended, `claude-opus-5-5`, `claude-haiku-5-5`); OpenAI: **GPT-6.1 Sol** (recommended) / **GPT-6.1 Terra** / **GPT-6 Luna** / **GPT-6 Astra**, plus the specialized **`gpt-5.6-cyber`** cybersecurity model for authorized vulnerability research; Google Gemini: **`gemini-flash-latest`** (documented always-current alias) with **Gemini 3.8 Flash** / 3.6 Flash; xAI: **grok-4.7**; Kimi: **kimi-k3** in the model list; Z.AI: **glm-5.3** flagship (with 5.3-flash / 5.2 / 5.1 / 4.7) on both the standard and Coding Plan entries; Groq and Mistral aliases confirmed still current (Groq: llama-3.3-70b / llama-3.1-8b / gpt-oss-120b / gpt-oss-20b; Mistral: Large 4 via `mistral-large-latest`). Previous-generation IDs remain selectable; the OpenAI default is now `gpt-6.1-sol`, Anthropic `claude-sonnet-5-5`, Gemini `gemini-flash-latest`, xAI `grok-4.7`, Z.AI `glm-5.3`.
+
+### Added
+- **New AI Hunt class — LLM / AI Feature (Prompt Injection)** (13 classes total, High) — flags parameters that feed server-side LLM features (`prompt`, `messages`, `system_prompt`, `instruction`, `agent`, `model`, …) with prompt-injection methodology (instruction override, system-prompt disclosure, tool abuse, data exfiltration via rendered links, auth/rate-limit checks on AI endpoints) and ready-to-try payloads. Reflects the OWASP LLM Top 10 threat model for 2026-era applications.
+
+### Fixed
+- **Chatty models no longer leak narration into findings** — some models (observed with GLM) open with "Let me analyze this HTTP transaction carefully..." instead of the mandated finding format, which packaged the whole narration as a single "AI Analysis Result" fallback finding. Leading/trailing conversational lines are now stripped before parsing (substantive content like the technology-stack notes is kept), and the system prompt adds an explicit "NO conversational narration" output rule (rule 8) targeting this model behaviour.
+- **Passive (Proxy) and JS scan toggles are now persisted** across Burp restarts (previously they reset to off on every reload).
+- **JS digest now triggers on `.js` URLs too** — minified bundles that lack the text heuristics were analyzed without the full-file digest; the URL alone now activates it.
+- **AI Hunt class filter includes the JS/Tech hit classes** (JS Library Fingerprint / Outdated (CVE), Secret / Credential in JS, Source Map Disclosed, JS DOM Sink, JS Endpoint Disclosure, Tech Disclosure) — previously these rows were only visible under "All classes".
+- **AI Discover severity mapping for the new LLM class rated Medium instead of High** — the class-to-severity table used by AI Discover lacked an entry for prompt injection, so AI-proposed LLM rows surfaced as Medium while the equivalent heuristic candidates were High. `prompt injection` / `llm` now map to High.
+
+---
+
 ## [v1.6.0] — 2026-10-06
 
 ### Added

@@ -114,16 +114,16 @@ OAI_COMPAT_PROVIDERS = [
      "deepseek-chat (V-series, general)  |  deepseek-reasoner (reasoning / chain-of-thought)"),
     ("Kimi (Moonshot)", "https://api.moonshot.ai/v1", "kimi-latest",
      "platform.moonshot.ai",
-     "kimi-latest  |  kimi-k2-0905-preview  |  moonshot-v1-8k / -32k / -128k"),
+     "kimi-latest  |  kimi-k3  |  kimi-k2.6  |  moonshot-v1-8k / -32k / -128k"),
     ("Mistral", "https://api.mistral.ai/v1", "mistral-large-latest",
      "console.mistral.ai",
-     "mistral-large-latest  |  mistral-medium-latest  |  mistral-small-latest  |  codestral-latest"),
+     "mistral-large-latest (Large 4)  |  mistral-medium-latest  |  mistral-small-latest  |  codestral-latest"),
     ("Groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile",
      "console.groq.com/keys",
-     "llama-3.3-70b-versatile  |  llama-3.1-8b-instant  |  openai/gpt-oss-120b  |  moonshotai/kimi-k2-instruct"),
-    ("xAI (Grok)", "https://api.x.ai/v1", "grok-4.6",
+     "llama-3.3-70b-versatile  |  llama-3.1-8b-instant  |  openai/gpt-oss-120b  |  openai/gpt-oss-20b"),
+    ("xAI (Grok)", "https://api.x.ai/v1", "grok-4.7",
      "console.x.ai",
-     "grok-4.6  |  grok-4.5  |  grok-4.3  (see console.x.ai/models)"),
+     "grok-4.7 (latest)  |  grok-4.6  |  grok-4.5  |  grok-4.3  (see console.x.ai/models)"),
     # OpenCode Zen — a hosted model gateway. OpenAI-compatible at /zen/v1.
     ("OpenCode Zen", "https://opencode.ai/zen/v1", "claude-sonnet-5",
      "opencode.ai/zen",
@@ -131,14 +131,14 @@ OAI_COMPAT_PROVIDERS = [
     # Z.AI — Zhipu's international platform; OpenAI-compatible at /api/paas/v4.
     # Standard pay-as-you-go API keys live here. GLM Coding Plan keys are ONLY
     # valid on the coding endpoint -> dedicated "Z.AI Coding Plan (GLM)" entry.
-    ("Z.AI (GLM)", "https://api.z.ai/api/paas/v4", "glm-4.6",
+    ("Z.AI (GLM)", "https://api.z.ai/api/paas/v4", "glm-5.3",
      "z.ai",
-     "Standard (pay-as-you-go) API key. glm-4.6 (flagship, 200k ctx)  |  glm-4.5  |  glm-4.5-air  |  glm-4.5-flash (free)"),
+     "Standard (pay-as-you-go) API key. glm-5.3 (flagship)  |  glm-5.3-flash  |  glm-5.2  |  glm-5.1  |  glm-4.7"),
     # GLM Coding Plan: key is bound to the coding endpoint; standard /api/paas/v4
     # rejects it. Same models; separate settings key so both keys coexist.
-    ("Z.AI Coding Plan (GLM)", "https://api.z.ai/api/coding/paas/v4", "glm-4.6",
+    ("Z.AI Coding Plan (GLM)", "https://api.z.ai/api/coding/paas/v4", "glm-5.3",
      "z.ai (Coding Plan)",
-     "GLM Coding Plan key ONLY (Personal/Pro plan). glm-4.6  |  glm-4.5  |  glm-4.5-air"),
+     "GLM Coding Plan key ONLY (Personal/Pro plan). glm-5.3  |  glm-5.2  |  glm-5.1  |  glm-4.7"),
     # Custom — any internal/OpenAI-compatible gateway (LiteLLM, Azure OpenAI-
     # compatible surface, private proxy). Base URL must be filled in by the user.
     ("Custom (OpenAI-compatible)", "", "", "your LLM gateway",
@@ -805,7 +805,7 @@ class APIClient(object):
         if provider == "Anthropic":
             return self.call_anthropic(
                 api_key=settings.get("anthropic_key", ""),
-                model=settings.get("anthropic_model", "claude-sonnet-5"),
+                model=settings.get("anthropic_model", "claude-sonnet-5-5"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -813,7 +813,7 @@ class APIClient(object):
         elif provider == "OpenAI":
             return self.call_openai(
                 api_key=settings.get("openai_key", ""),
-                model=settings.get("openai_model", "gpt-5.1"),
+                model=settings.get("openai_model", "gpt-6.1-sol"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -821,7 +821,7 @@ class APIClient(object):
         elif provider == "OpenRouter":
             return self.call_openrouter(
                 api_key=settings.get("openrouter_key", ""),
-                model=settings.get("openrouter_model", "anthropic/claude-sonnet-5"),
+                model=settings.get("openrouter_model", "anthropic/claude-sonnet-5.5"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,
@@ -829,7 +829,7 @@ class APIClient(object):
         elif provider == "Gemini":
             return self.call_gemini(
                 api_key=settings.get("gemini_key", ""),
-                model=settings.get("gemini_model", "gemini-2.5-flash"),
+                model=settings.get("gemini_model", "gemini-flash-latest"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 max_tokens=max_tokens,

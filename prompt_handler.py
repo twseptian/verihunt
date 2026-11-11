@@ -61,8 +61,9 @@ Step 6 -- REMEDIATION:
    - Firm: strong indicators in the provided data with only minor assumptions.
    - Tentative: a hypothesis based on parameter names or structure that you CANNOT confirm from the passive request/response (e.g. inferring LFI/SQLi/SSRF from a parameter without an actual payload response). This tool does NOT send payloads, so anything requiring active testing is Tentative.
    Findings you mark Tentative are automatically labelled "Potential <name>" -- that is correct and expected. Do NOT mark something Certain/Firm unless the evidence is actually present in the data you were given.
-8. Include CVSS 3.1 vector string where possible, not just the score.
-9. For any CVE referenced, confirm it matches the observed version/component before citing it."""
+8. NO conversational narration. Never write "Let me analyze...", "Let me check...", "I'll now...", "Here is what I found" or any thinking-out-loud text. Your ENTIRE response is either finding blocks, or the single "# No Vulnerabilities Identified" block with its Explain section -- nothing else.
+9. Include CVSS 3.1 vector string where possible, not just the score.
+10. For any CVE referenced, confirm it matches the observed version/component before citing it."""
 
 
 DEFAULT_USER_PROMPT_TEMPLATE = """You are performing a professional web application penetration test. Analyze the HTTP transaction below with the thoroughness of a WSTG-compliant assessment. Every finding must cite specific evidence from the provided data.

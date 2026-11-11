@@ -39,6 +39,7 @@ from api_client import APIClient as _APIClient
 from api_client import OAI_COMPAT_PROVIDERS, OAI_COMPAT_KEYS
 from api_client import get_usage as _get_usage, reset_usage as _reset_usage
 import hunt_engine as _hunt
+import js_engine as _js
 from javax.swing import UIManager
 
 
@@ -417,6 +418,10 @@ class UI(object):
         self._save_str("max_tokens",      self._max_tokens.getText())
         self._save_str("max_concurrent",  self._max_concurrent.getText())
         self._save_str("scope_only",      str(self._scope_only_chk.isSelected()))
+        if hasattr(self, "_hunt_passive_cb"):
+            self._save_str("hunt_passive", str(self._hunt_passive_cb.isSelected()))
+        if hasattr(self, "_js_scan_cb"):
+            self._save_str("js_scan", str(self._js_scan_cb.isSelected()))
         self._save_str("self_verify",     str(self._self_verify_chk.isSelected()))
         self._save_str("theme_mode",      str(self._theme_combo.getSelectedItem()))
         self._save_str("prompt",          self._prompt_area.getText())
@@ -429,13 +434,13 @@ class UI(object):
             self._provider_combo.setSelectedItem(self._load_str("provider", "Anthropic"))
             # API keys loaded and de-obfuscated
             self._ant_key.setText(_deobfuscate(self._load_str("anthropic_key", "")))
-            self._ant_model.setSelectedItem(self._load_str("anthropic_model", "claude-sonnet-5"))
+            self._ant_model.setSelectedItem(self._load_str("anthropic_model", "claude-sonnet-5-5"))
             self._oai_key.setText(_deobfuscate(self._load_str("openai_key", "")))
-            self._oai_model.setSelectedItem(self._load_str("openai_model", "gpt-5.1"))
+            self._oai_model.setSelectedItem(self._load_str("openai_model", "gpt-6.1-sol"))
             self._or_key.setText(_deobfuscate(self._load_str("or_key", "")))
-            self._or_model.setText(self._load_str("or_model", "anthropic/claude-sonnet-5"))
+            self._or_model.setText(self._load_str("or_model", "anthropic/claude-sonnet-5.5"))
             self._gem_key.setText(_deobfuscate(self._load_str("gemini_key", "")))
-            self._gem_model.setSelectedItem(self._load_str("gemini_model", "gemini-2.5-flash"))
+            self._gem_model.setSelectedItem(self._load_str("gemini_model", "gemini-flash-latest"))
             self._ollama_mode.setSelectedItem(self._load_str("ollama_mode", "Local server"))
             self._ollama_url.setText(self._load_str("ollama_url", "http://localhost:11434"))
             self._ollama_key.setText(_deobfuscate(self._load_str("ollama_key", "")))
@@ -452,6 +457,12 @@ class UI(object):
             self._max_concurrent.setText(self._load_str("max_concurrent", "2"))
             self._scope_only_chk.setSelected(
                 self._load_str("scope_only", "False").lower() == "true")
+            if hasattr(self, "_hunt_passive_cb"):
+                self._hunt_passive_cb.setSelected(
+                    self._load_str("hunt_passive", "False").lower() == "true")
+            if hasattr(self, "_js_scan_cb"):
+                self._js_scan_cb.setSelected(
+                    self._load_str("js_scan", "False").lower() == "true")
             self._self_verify_chk.setSelected(
                 self._load_str("self_verify", "True").lower() == "true")
             self._theme_combo.setSelectedItem(self._load_str("theme_mode", "Auto"))
@@ -728,7 +739,9 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._ant_key   = JPasswordField(40)
-        self._ant_model = JComboBox(["claude-sonnet-5", "claude-opus-5",
+        self._ant_model = JComboBox(["claude-sonnet-5-5", "claude-opus-5-5",
+                                     "claude-haiku-5-5",
+                                     "claude-sonnet-5", "claude-opus-5",
                                      "claude-haiku-4-5-20251001",
                                      "claude-fable-5-1",
                                      "claude-opus-4-8"])
@@ -751,7 +764,9 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._oai_key   = JPasswordField(40)
-        self._oai_model = JComboBox(["gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
+        self._oai_model = JComboBox(["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna",
+                                     "gpt-6-astra", "gpt-5.6-cyber",
+                                     "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano",
                                      "gpt-4.1", "gpt-4o", "o3", "o4-mini"])
         self._oai_model.setEditable(True)   # let users type any newer/other model id
         self._oai_status = self._conn_status_lbl()
@@ -772,7 +787,7 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._or_key   = JPasswordField(40)
-        self._or_model = JTextField("anthropic/claude-sonnet-5", 40)
+        self._or_model = JTextField("anthropic/claude-sonnet-5.5", 40)
         self._or_status = self._conn_status_lbl()
         _client = self._api_client
         _key_f  = self._or_key
@@ -804,7 +819,10 @@ class UI(object):
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8))
         rows = JPanel(GridLayout(0, 1, 2, 2))
         self._gem_key   = JPasswordField(40)
-        self._gem_model = JComboBox(["gemini-2.5-flash",
+        self._gem_model = JComboBox(["gemini-flash-latest",
+                                     "gemini-3.8-flash",
+                                     "gemini-3.6-flash",
+                                     "gemini-2.5-flash",
                                      "gemini-2.5-pro",
                                      "gemini-2.5-flash-lite",
                                      "gemini-3-flash-preview",
@@ -1429,6 +1447,16 @@ class UI(object):
             "proxy thread, so it stays light.")
         header.add(self._hunt_passive_cb)
 
+        self._js_scan_cb = JCheckBox("JS scan", False)
+        self._js_scan_cb.setToolTipText(
+            "Also analyse JavaScript files on Proxy traffic (requires Passive "
+            "(Proxy)): fingerprints frontend libraries + exact versions with "
+            "AUTOMATIC CVE matching via OSV.dev (fresh GHSA/NVD data; traffic "
+            "goes to api.osv.dev, never to the target) plus an offline ruleset "
+            "fallback, and detects hardcoded secrets, exposed source maps, DOM "
+            "sinks and API endpoints. Runs off the proxy thread.")
+        header.add(self._js_scan_cb)
+
         # Retroactively scan Burp's existing Proxy history. Passive only sees traffic
         # that arrives AFTER you tick the box, so anything browsed earlier (or with
         # Passive off) is invisible until you press this.
@@ -1455,6 +1483,11 @@ class UI(object):
             _classes.append(_hunt.GENERIC_CLASS)
         except Exception:
             pass
+        for _jcls in ("JS Library Fingerprint", "JS Library Outdated (CVE)",
+                      "Secret / Credential in JS", "Source Map Disclosed",
+                      "JS DOM Sink (review)", "JS Endpoint Disclosure",
+                      "Tech Disclosure (Headers)"):
+            _classes.append(_jcls)
         self._hunt_class_combo = JComboBox(_classes)
         self._hunt_class_combo.addActionListener(lambda e: self._hunt_rebuild_table())
         header.add(self._hunt_class_combo)
@@ -1641,9 +1674,95 @@ class UI(object):
             pass
 
     def hunt_passive_scan(self, message):
-        """Run heuristics on one proxied message and add new hits (thread-safe)."""
+        """Run heuristics on one proxied message and add new hits (thread-safe).
+        JavaScript responses go through the deterministic JS engine instead
+        (library fingerprints, secrets, source maps, DOM sinks, endpoints),
+        optionally with CVE matching (offline ruleset + opt-in OSV.dev lookup).
+        Non-JS messages get a Tech Disclosure candidate from version-bearing
+        response headers."""
         try:
-            hits = _hunt.analyze(self._helpers, message)
+            hits = []
+            js_used = False
+            try:
+                if self._js_scan_cb.isSelected():
+                    rb = message.getResponse()
+                    body = self._helpers.bytesToString(rb) if rb else u""
+                    ri = self._helpers.analyzeRequest(message)
+                    is_js = _js.is_js_url(ri.getUrl().toString()) or \
+                            _js.is_js_text(body)
+                    if body and is_js:
+                        js_used = True
+                        uo = ri.getUrl()
+                        full = uo.toString()
+                        try:
+                            netloc = uo.getHost()
+                            port = uo.getPort()
+                            if port not in (80, 443, -1, 0):
+                                netloc = u"{0}:{1}".format(netloc, port)
+                        except Exception:
+                            netloc = u""
+                        dg = _js.digest_js(body)
+                        # AUTOMATIC CVE matching: OSV.dev exact-version query
+                        # (fresh GHSA/NVD data, cached per session; traffic
+                        # goes to api.osv.dev, never to the target), with the
+                        # embedded ruleset as offline fallback.
+                        import api_client as _ac
+                        cve_map = _js.cve_map_for_libraries(
+                            dg.get("libraries", []),
+                            post_fn=lambda u, b: _ac._http_post(
+                                u, {"Content-Type": "application/json"},
+                                b, 12000),
+                            online=True, max_queries=12)
+                        hits = _js.js_hits(dg, ri.getMethod(), netloc,
+                                           ri.getPath(), full,
+                                           cve_map=cve_map)
+            except Exception:
+                js_used = False
+            if not js_used:
+                hits = _hunt.analyze(self._helpers, message)
+                # Tech Disclosure from version-bearing response headers
+                try:
+                    rb = message.getResponse()
+                    if rb:
+                        hs = self._helpers.analyzeResponse(rb).getHeaders()
+                        tech = []
+                        for h in hs:
+                            s = str(h)
+                            if re.match(
+                                    r"(?i)^(Server|X-Powered-By|X-AspNet-Version|"
+                                    r"X-Generator|X-Version):\s+\S", s):
+                                tech.append(s.strip())
+                        if tech:
+                            ri = self._helpers.analyzeRequest(message)
+                            uo = ri.getUrl()
+                            host = uo.getHost() if uo else u"host"
+                            val = u" | ".join(tech[:4])
+                            hits.append({
+                                "cls": u"Tech Disclosure (Headers)",
+                                "sev": u"Information",
+                                "param": u"headers", "where": u"headers",
+                                "value": val[:60], "value_full": val[:160],
+                                "method": ri.getMethod(),
+                                "path": ri.getPath() if uo else u"/",
+                                "url": uo.toString() if uo else u"",
+                                "endpoint": u"{0} {1}".format(
+                                    ri.getMethod(),
+                                    (uo.getHost() if uo else u"")),
+                                "why": u"Server/software versions disclosed in "
+                                       u"response headers help an attacker map "
+                                       u"potentially vulnerable components.",
+                                "methodology": u"Triage (AI) can map these "
+                                       u"versions to known CVEs; consider "
+                                       u"suppressing or generalizing version "
+                                       u"banners at the web server.",
+                                "payloads": [], "conf": "heuristic",
+                                "ai_verdict": "", "ai_reason": "",
+                                "ai_payloads": [], "ai_next": "",
+                                "dedup_key": u"tech {0} {1}".format(
+                                    host.lower(), val)[:200],
+                            })
+                except Exception:
+                    pass
         except Exception:
             return
         if not hits:
@@ -2620,9 +2739,10 @@ class UI(object):
         ])
 
         _feat("AI Hunt (passive heuristics + enhanced AI triage)", [
-            "HUNT-style scanner: flags suspicious parameters by name/value across 12 vuln",
+            "HUNT-style scanner: flags suspicious parameters by name/value across 13 vuln",
             "classes (SQLi, XSS, LFI/Path Traversal, SSRF, IDOR/BOLA, Command Injection,",
-            "SSTI, XXE, Open Redirect, Deserialization, Mass-Assignment, Debug).",
+            "SSTI, XXE, Open Redirect, Deserialization, Mass-Assignment, Debug,",
+            "LLM/AI Prompt Injection).",
             "Every user-controllable parameter is surfaced: names/values that match a class",
             "are flagged as that class; anything else is listed as 'Other Parameter (review)'",
             "(Information) so a parameterised request is never silently empty (noise tokens",
@@ -2635,6 +2755,13 @@ class UI(object):
             "'Scan History' to run the heuristics over Burp's existing Proxy history",
             "retroactively (honours 'Scope only', skips static assets) -- use it when",
             "candidates are missing for a target you already browsed.",
+            "JS scan (tick next to Passive): fingerprints frontend libraries + versions",
+            "in .js files with AUTOMATIC CVE matching (OSV.dev + offline ruleset), and",
+            "detects hardcoded secrets, exposed source maps, DOM sinks and API",
+            "endpoints. Quiet by design: only CVE-matched libraries, secrets, source",
+            "maps and per-host endpoints become table candidates -- clean",
+            "fingerprints and bare sinks stay in the AI digest. JS responses analyzed",
+            "with AI also get a full-file digest attached to the prompt.",
             "Pick a candidate to see why + methodology + the real Request/Response viewer;",
             "right-click -> Deep Analyze (AI) / Send to Repeater / Send to Intruder / Copy URL.",
             "Triage (AI) [on-demand]: evidence-grounded -- feeds reflection, SQL-error,",
@@ -2689,17 +2816,17 @@ class UI(object):
         # ---- Providers ----
         content.add(_lbl("Supported Providers", _sans_b, _orange, top=6, bot=2))
         content.add(_lbl("  Anthropic   --  Claude 5 family (Sonnet 5, Opus 5, Haiku 4.5, Fable 5.1)", _mono))
-        content.add(_lbl("  OpenAI      --  GPT-5.x, GPT-4.1/4o, o3/o4-mini", _mono))
+        content.add(_lbl("  OpenAI      --  GPT-6.1 Sol/Terra, GPT-6 Luna/Astra, GPT-5.6 Cyber, GPT-5.x", _mono))
         content.add(_lbl("  OpenRouter  --  400+ models via unified API (free & paid)", _mono))
         content.add(_lbl("  Gemini      --  Google Gemini 3.x / 2.5 (pro, flash, flash-lite)", _mono))
         content.add(_lbl("  Ollama      --  Any local model (qwen, llama, mistral, deepseek)", _mono))
         content.add(_lbl("  DeepSeek    --  deepseek-chat (V-series), deepseek-reasoner", _mono))
-        content.add(_lbl("  Kimi        --  Moonshot kimi-latest / kimi-k2 / moonshot-v1-*", _mono))
+        content.add(_lbl("  Kimi        --  Moonshot kimi-latest / kimi-k3 / kimi-k2 / moonshot-v1-*", _mono))
         content.add(_lbl("  Mistral     --  mistral-large / medium / small, codestral", _mono))
-        content.add(_lbl("  Groq        --  llama-3.3/4, gpt-oss, kimi-k2 (very fast inference)", _mono))
-        content.add(_lbl("  xAI (Grok)  --  grok-4.6 / 4.5 / 4.3", _mono))
+        content.add(_lbl("  Groq        --  llama-3.3-70b, llama-3.1-8b, gpt-oss-120b/20b (very fast)", _mono))
+        content.add(_lbl("  xAI (Grok)  --  grok-4.7 (latest) / 4.6 / 4.5", _mono))
         content.add(_lbl("  OpenCode Zen--  gateway (claude-sonnet-5, gpt-5.1, kimi-k3, ...)", _mono))
-        content.add(_lbl("  Z.AI (GLM)  --  glm-4.6 (flagship) / glm-4.5 / -air / -flash", _mono))
+        content.add(_lbl("  Z.AI (GLM)  --  glm-5.3 (flagship) / 5.3-flash / 5.2 / 5.1 / 4.7", _mono))
         content.add(_lbl("  Z.AI Coding Plan --  SAME models; use this entry for GLM Coding", _mono))
         content.add(_lbl("                  Plan keys (endpoint .../api/coding/paas/v4)", _mono))
         content.add(_lbl("  Custom      --  your OpenAI-compatible gateway (LiteLLM, Azure,", _mono))
@@ -2714,14 +2841,20 @@ class UI(object):
 
         sections = [
             ("Anthropic", [
-                ("  claude-sonnet-5          ", "out: 64k ", "ctx: 200k", "Best balance speed + quality  [Recommended]"),
+                ("  claude-sonnet-5-5        ", "out: 64k ", "ctx: 200k+", "Best balance speed + quality  [Recommended]"),
+                ("  claude-opus-5-5          ", "out: 128k", "ctx: 200k+", "Flagship; suggested starting point for heavy work"),
+                ("  claude-haiku-5-5         ", "out: 64k ", "ctx: 200k+", "Fastest 5.5, lowest cost"),
                 ("  claude-opus-5            ", "out: 32k ", "ctx: 200k", "Highest accuracy, slower"),
                 ("  claude-haiku-4-5         ", "out: 16k ", "ctx: 200k", "Fastest, lowest cost"),
                 ("  claude-fable-5-1         ", "out: varies", "ctx: 200k", "Lightweight Claude 5"),
                 ("  claude-opus-4-8          ", "out: 32k ", "ctx: 200k", "Previous flagship, still strong"),
             ]),
             ("OpenAI", [
-                ("  gpt-5.1                  ", "out: varies", "ctx: 400k", "Latest general model  [Recommended]"),
+                ("  gpt-6.1-sol              ", "out: 128k", "ctx: 1.05M", "Near-flagship, balanced cost  [Recommended]"),
+                ("  gpt-6.1-terra            ", "out: 128k", "ctx: 1.05M", "Fast; visual reasoning + computer use"),
+                ("  gpt-6-luna               ", "out: 128k", "ctx: 1.05M", "Cheapest; bulk scans"),
+                ("  gpt-6-astra              ", "out: 128k", "ctx: 1.05M", "Most capable, priciest"),
+                ("  gpt-5.6-cyber            ", "out: varies", "ctx: varies", "Cybersecurity model for authorized vuln research"),
                 ("  gpt-5                    ", "out: varies", "ctx: 400k", "GPT-5 base"),
                 ("  gpt-5-mini               ", "out: varies", "ctx: 400k", "Cheaper, fast, good for bulk"),
                 ("  gpt-4.1                  ", "out: 32k ", "ctx:   1M", "Large-context general model"),
@@ -2733,7 +2866,9 @@ class UI(object):
                 ("  Paid models (claude/gpt/gemini)   ", "out: varies", "ctx: varies", "Same limits as direct provider"),
             ]),
             ("Gemini", [
-                ("  gemini-2.5-flash         ", "out:  8k ", "ctx:   1M", "Fast, free tier  [Recommended]"),
+                ("  gemini-flash-latest      ", "out: varies", "ctx:   1M", "Alias tracking the latest Flash  [Recommended]"),
+                ("  gemini-3.8-flash         ", "out: varies", "ctx:   1M", "Most intelligent Flash; long-horizon agents"),
+                ("  gemini-3.6-flash         ", "out: varies", "ctx:   1M", "Previous-gen Flash, stable"),
                 ("  gemini-2.5-pro           ", "out: 65k ", "ctx:   1M", "Best 2.5 quality"),
                 ("  gemini-2.5-flash-lite    ", "out:  8k ", "ctx:   1M", "Lightest, cheapest"),
                 ("  gemini-3-flash-preview   ", "out: varies", "ctx:   1M", "Gemini 3 fast (preview)"),
@@ -2770,12 +2905,14 @@ class UI(object):
                 ("  moonshotai/kimi-k2-instruct", "out: varies", "ctx: 256k", "Kimi K2 on Groq"),
             ]),
             ("xAI (Grok)", [
-                ("  grok-4.6               ", "out: varies", "ctx: 256k", "Latest flagship  [Recommended]"),
+                ("  grok-4.7               ", "out: varies", "ctx: 256k", "Latest flagship  [Recommended]"),
                 ("  grok-4.5               ", "out: varies", "ctx: 256k", "Previous flagship"),
                 ("  grok-4.3               ", "out: varies", "ctx: 256k", "Extended-context variant"),
             ]),
             ("Z.AI (GLM)", [
-                ("  glm-4.6                ", "out: 128k", "ctx: 200k", "Flagship; strong agentic/coding  [Recommended]"),
+                ("  glm-5.3                ", "out: 128k", "ctx: 200k", "Flagship; strong agentic/coding  [Recommended]"),
+                ("  glm-5.3-flash          ", "out: 128k", "ctx: 200k", "Fast variant of the flagship"),
+                ("  glm-5.2                ", "out: 128k", "ctx: 200k", "Previous flagship"),
                 ("  glm-4.5                ", "out:  96k", "ctx: 128k", "Previous flagship"),
                 ("  glm-4.5-air            ", "out:  96k", "ctx: 128k", "Lighter, faster, cheaper"),
                 ("  glm-4.5-flash          ", "out:  96k", "ctx: 128k", "Free tier; good for bulk scans"),
@@ -2800,12 +2937,15 @@ class UI(object):
 
         tok_sections = [
             ("Anthropic", [
-                ("  claude-sonnet-5    ", "4096-8192", "3-5", "Best quality; handles large responses"),
+                ("  claude-sonnet-5-5  ", "4096-8192", "3-5", "Best quality; handles large responses"),
+                ("  claude-opus-5-5    ", "4096-8192", "2-3", "Flagship; lower concurrent to avoid timeout"),
                 ("  claude-opus-5      ", "4096-8192", "2-3", "Slower; lower concurrent to avoid timeout"),
                 ("  claude-haiku-4-5   ", "2048-4096", "5-8", "High concurrency OK, very fast"),
             ]),
             ("OpenAI", [
-                ("  gpt-5.1            ", "4096-8192", "3-5", "Balanced speed + quality"),
+                ("  gpt-6.1-sol        ", "4096-8192", "3-5", "Balanced speed + quality"),
+                ("  gpt-6.1-terra      ", "4096-8192", "3-5", "Fast; good for bulk"),
+                ("  gpt-6-luna         ", "2048-4096", "5-8", "Cheapest; high concurrency OK"),
                 ("  gpt-5-mini         ", "4096-8192", "5-8", "Best for bulk; cheap + fast"),
                 ("  o3 / o4-mini       ", "4096",      "1-2", "Slow; reasoning tokens billed extra"),
             ]),
@@ -2814,7 +2954,8 @@ class UI(object):
                 ("  Paid models        ", "4096-8192", "3-5", "Same limits as direct provider"),
             ]),
             ("Gemini", [
-                ("  gemini-2.5-pro     ", "4096-8192", "3-5", "Free: 15 req/min; paid: 360 req/min"),
+                ("  gemini-flash-latest", "2048-4096", "3-5", "Tracks latest Flash; check rate limits"),
+                ("  gemini-3.8-flash   ", "4096-8192", "3-5", "Newest Flash generation"),
                 ("  gemini-2.5-flash   ", "2048-4096", "3-5", "Fast; generous free tier"),
                 ("  gemini-3.1-pro-preview", "4096-8192", "2-3", "Newest; preview rate limits"),
             ]),
@@ -2840,10 +2981,10 @@ class UI(object):
                 ("  llama-3.1-8b       ", "4096",      "8-10","Fastest; best for bulk scans"),
             ]),
             ("xAI (Grok)", [
-                ("  grok-4.6           ", "4096-8192", "3-5", "General purpose flagship"),
+                ("  grok-4.7           ", "4096-8192", "3-5", "General purpose flagship"),
             ]),
             ("Z.AI (GLM)", [
-                ("  glm-4.6            ", "4096-8192", "3-5", "Flagship; great for deep analysis"),
+                ("  glm-5.3            ", "4096-8192", "3-5", "Flagship; great for deep analysis"),
                 ("  glm-4.5-flash      ", "<=4096",     "5-8", "Free tier; fast for bulk scans"),
             ]),
         ]
@@ -2996,6 +3137,12 @@ class UI(object):
         except Exception as ex:
             self._status_lbl.setText("Clear memory failed: " + str(ex))
 
+    def get_js_scan(self):
+        try:
+            return self._js_scan_cb.isSelected()
+        except Exception:
+            return False
+
     def get_scope_only(self):
         return self._scope_only_chk.isSelected()
 
@@ -3070,7 +3217,7 @@ class UI(object):
         import time
         return {
             "tool": "VeriHunt",
-            "version": "1.6.0",
+            "version": "1.9.0",
             "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 

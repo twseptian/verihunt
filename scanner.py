@@ -368,6 +368,45 @@ class Scanner(object):
                 memory_context    = mem_ctx,
             )
 
+            # JS responses: the raw body is far larger than the prompt budget,
+            # so attach a deterministic digest (libraries+versions, secrets,
+            # source maps, DOM sinks, endpoints) computed over the FULL file.
+            try:
+                import js_engine as _js
+                if response_bytes:
+                    _full = self._helpers.bytesToString(response_bytes)
+                    try:
+                        _u = request_info.getUrl().toString()
+                    except Exception:
+                        _u = u""
+                    # trigger on a .js URL too - minified bundles can lack the
+                    # text heuristics that is_js_text looks for
+                    if _js.is_js_text(_full) or _js.is_js_url(_u):
+                        _dg = _js.digest_js(_full)
+                        import api_client as _ac
+                        _cmap = _js.cve_map_for_libraries(
+                            _dg.get("libraries", []),
+                            post_fn=lambda u, b: _ac._http_post(
+                                u, {"Content-Type": "application/json"},
+                                b, 12000),
+                            online=True, max_queries=12)
+                        _ctx = _js.build_js_context(_dg, cve_map=_cmap)
+                        if _ctx:
+                            user_prompt += (u"\n\n=== JS ANALYSIS DIGEST "
+                                            u"(deterministic pre-scan of the "
+                                            u"FULL JavaScript file; the raw "
+                                            u"response above may be "
+                                            u"truncated) ===\n" + _ctx)
+                            self._log("JS digest attached: {0} lib(s), "
+                                      "{1} secret(s), {2} sink(s), "
+                                      "{3} endpoint(s)".format(
+                                          len(_dg.get("libraries", [])),
+                                          len(_dg.get("secrets", [])),
+                                          len(_dg.get("sinks", [])),
+                                          len(_dg.get("endpoints", []))))
+            except Exception:
+                pass
+
             self._log("Calling {0} API for {1}...".format(provider, url))
 
             ai_text = self.api_client.call_api(

@@ -1,10 +1,8 @@
 # VeriHunt
 
-AI-powered security analysis for Burp Suite, part of the **Agentic Web Pentest** project.
-
-Analyze HTTP requests and responses directly inside Burp Suite using any major LLM
-provider. Findings are structured, severity-classified, and registered as native
-Burp scan issues.
+Burp Suite extension that sends HTTP requests and responses to an LLM and
+registers structured findings as native Burp scan issues. Part of the Agentic
+Web Pentest project.
 
 ## Screenshots
 
@@ -32,241 +30,203 @@ AI Hunt discovery and triage:
 
 ![AI Hunt discover result](docs/screenshots/07.verihunt-ai-hunt-discover-result.png)
 
-AI Assistant chat grounded on the selected request:
+AI Assistant chat on the selected request:
 
 ![Chat with AI](docs/screenshots/08.verihunt-chat-with-AI.png)
 
-Dashboard view of findings:
+Dashboard of findings:
 
 ![Dashboard result](docs/screenshots/09.verihunt-dashboard-result.png)
 
 ## Features
 
-### AI Analysis (Results tab)
+### AI Analysis
 
-Right-click any request and choose *Analyze with AI*. Single or batch/queue
-(select many in Proxy history, then "Analyze N requests with AI") with
-concurrent workers, live progress and Stop.
+Right-click a request → **VeriHunt → Analyze with AI**. Batch from Proxy
+history ("Analyze N requests with AI") with concurrent workers, progress, and
+Stop.
 
-Optional **Self-verify** adds a second AI pass that cuts false positives without
-discarding attack-surface hypotheses: Potential SQLi, auth-bypass, LFI and SSRF
-findings that a passive response can never prove are kept, not dropped.
-Re-analyzing an endpoint no longer produces duplicate findings (de-duplication
-by severity, URL and parameter). Findings become native Burp scan issues with
-Advisory and Analyzed Request/Response tabs, Toggle False Positive, and an
-AI Assistant chat.
+**Self-verify** (on by default) runs a second pass against the real response:
+proven findings stay, unproven ones become **Potential**, refuted ones drop.
+Re-analyzing the same endpoint de-duplicates by severity, URL, and parameter.
 
-### AI Hunt (passive heuristics + enhanced AI triage)
+Findings become Burp issues with Advisory, Analyzed Request/Response, Toggle
+False Positive, and an AI Assistant chat grounded on the selected exchange.
 
-HUNT-style flagging of suspicious parameters across 13 vulnerability classes:
-SQLi, XSS, LFI/Path Traversal, SSRF, IDOR/BOLA, Command Injection, SSTI, XXE,
-Open Redirect, Deserialization, Mass-Assignment, Debug, and LLM/AI Prompt
-Injection, plus a generic "Other Parameter (review)" catch-all so no
-user-controllable input is missed.
+### AI Hunt
 
-Tick *Passive (Proxy)* to flag parameters as you browse, or press **Scan
-History** to run the heuristics over Burp's existing Proxy history
-retroactively: instant, free, no payloads, static assets skipped, off the
-proxy thread.
+Passive heuristics flag suspicious parameters across 13 classes (SQLi, XSS,
+LFI, SSRF, IDOR/BOLA, Command Injection, SSTI, XXE, Open Redirect,
+Deserialization, Mass-Assignment, Debug, LLM/Prompt Injection), plus an
+"Other Parameter (review)" catch-all.
 
-Candidates are POTENTIAL until validated. The optional **JS scan** also
-analyzes `.js` files: fingerprints frontend libraries with exact versions and
-automatic CVE matching via OSV.dev (offline ruleset fallback), detects
-hardcoded secrets (masked), exposed source maps, DOM sinks and API endpoints.
-Quiet by design: only CVE-matched libraries, secrets, source maps and per-host
-endpoints become candidates. JS responses analyzed with AI get a full-file
-digest attached to the prompt. Per-candidate Request/Response viewer plus
-right-click Deep Analyze (AI), Send to Repeater, Send to Intruder, Copy URL.
-**Triage (AI)** is evidence-grounded (reflection, SQL error, stack trace,
-status and content-type signals) and returns a verdict, confidence percentage,
-evidence, tailored payloads and a next step.
+- **Passive (Proxy):** flag params while you browse
+- **Scan History:** run the same heuristics over existing Proxy history
+  (no payloads, static assets skipped)
 
-### Cross-Scan Memory
+Candidates stay **Potential** until validated. Optional **JS scan**
+fingerprints libraries (exact versions), matches CVEs via OSV.dev with an
+offline ruleset fallback, and flags secrets (masked), source maps, DOM sinks,
+and API endpoints. Right-click a candidate for Deep Analyze (AI), Send to
+Repeater/Intruder, or Copy URL. **Triage (AI)** returns verdict, confidence,
+evidence, payloads, and a next step from response signals (reflection, SQL
+error, stack trace, status, content-type).
 
-Remembers, per host, your false positives and AI-confirmed findings (persisted
-across restarts). Later scans skip known false positives and stay aware of
-prior confirmations. Toggle with *Memory*; reset with *Clear Memory*.
+### Cross-scan memory
 
-### Reports and Export
+Per-host store of false positives and confirmed findings (survives restarts).
+Later scans skip known FPs. Toggle with *Memory*; reset with *Clear Memory*.
 
-Export JSON, or HTML and Markdown reports grouped by severity with PoC and
-remediation. Right-click any finding and choose *Copy as Markdown*.
+### Reports and tokens
 
-### Token Usage Tracker
+Export JSON, HTML, or Markdown (severity-grouped, PoC + remediation).
+Right-click a finding → *Copy as Markdown*. Results header shows last-call
+and session token counts.
 
-Last-call and running session token counts in the Results header (TPM and
-quota awareness).
+### Providers and theme
 
-### 12 providers
+14 provider entries (Anthropic, OpenAI, OpenRouter, Gemini, Ollama, DeepSeek,
+Kimi, Mistral, Groq, xAI, OpenCode Zen, Z.AI, Z.AI Coding Plan, Custom
+OpenAI-compatible). Per-provider tuning, *Test & Detect Models*, Auto /
+Light / Dark theme.
 
-Per-provider tuning plus *Test and Detect Models*, and Auto, Light or Dark
-theme.
+In-app **About** has the longer reference.
 
-## Providers Supported
+## Providers
 
-| Provider | Models (defaults; editable, use *Test and Detect Models* for the live list) |
+| Provider | Default / notes |
 | --- | --- |
-| Anthropic | claude-sonnet-5-5 (rec), claude-opus-5-5, claude-haiku-5-5, Claude 5 / 4.5 |
-| OpenAI | gpt-6.1-sol / -terra (rec), gpt-6-luna, gpt-6-astra, gpt-5.6-cyber, GPT-5.x |
-| OpenRouter | Any 400+ models via unified API (free and paid) |
-| Gemini | gemini-flash-latest (rec), gemini-3.8-flash, gemini-3.6-flash, gemini-2.5-* |
-| Ollama | Local server OR Ollama Cloud (ollama.com), model + optional API key |
-| DeepSeek | deepseek-chat (V-series), deepseek-reasoner |
-| Kimi | Moonshot kimi-latest (rec), kimi-k3, kimi-k2, moonshot-v1-8k/32k/128k |
+| Anthropic | claude-sonnet-5-5 (rec), opus/haiku 5.5 |
+| OpenAI | gpt-6.1-sol (rec), terra / luna / astra, gpt-5.6-cyber |
+| OpenRouter | Any catalog model (free and paid) |
+| Gemini | gemini-flash-latest (rec), 3.x / 2.5 family |
+| Ollama | Local or Ollama Cloud; optional API key |
+| DeepSeek | deepseek-chat, deepseek-reasoner |
+| Kimi | kimi-latest (rec), kimi-k3 / k2, moonshot-v1-* |
 | Mistral | mistral-large / medium / small, codestral |
-| Groq | llama-3.3-70b-versatile (rec), llama-3.1-8b-instant, gpt-oss-120b/20b (very fast) |
-| xAI (Grok) | grok-4.7 (rec), grok-4.6, grok-4.5, grok-4.3 |
-| OpenCode Zen | Gateway (claude-sonnet-5, gpt-5.1, kimi-k3, ...) |
-| Z.AI (GLM) | glm-5.3 (flagship, rec), glm-5.3-flash, glm-5.2, glm-5.1, glm-4.7 |
-| Z.AI Coding Plan | Same GLM models. Use this entry for GLM Coding Plan keys (coding endpoint) |
-| Custom | Any OpenAI-compatible gateway (LiteLLM, Azure-compatible, proxy). Set Base URL + Model |
+| Groq | llama-3.3-70b (rec), llama-3.1-8b, gpt-oss-* |
+| xAI (Grok) | grok-4.7 (rec), 4.6 / 4.5 / 4.3 |
+| OpenCode Zen | Gateway models |
+| Z.AI (GLM) | glm-5.3 (rec), 5.3-flash / 5.2 / 5.1 / 4.7 |
+| Z.AI Coding Plan | Same GLM models on the coding endpoint |
+| Custom | Any OpenAI-compatible base URL + model |
+
+Defaults are editable; *Test & Detect Models* pulls the live list.
 
 ## Installation
 
-### 1. Install Jython
+### Jython
 
-1. Download the **Jython Standalone** JAR from https://www.jython.org/download
-2. In Burp Suite: **Extensions > Extensions Settings > Python Environment**,
-   click **Select file** and choose the Jython JAR
+1. Download the Jython Standalone JAR from https://www.jython.org/download
+2. Burp → **Extensions → Extensions settings → Python environment** → select
+   the JAR
 
-### 2. Install VeriHunt
+### VeriHunt
 
-1. In Burp Suite: **Extensions > Add**
-2. Set **Extension type**: Python
-3. Set **Extension file**: `verihunt.py`
-4. Set **Folder for loading modules**: the folder containing all `.py` files
-   (this directory)
-5. Click **Next**. The extension loads without errors.
+1. Burp → **Extensions → Add**
+2. Extension type: **Python**
+3. Extension file: `verihunt.py`
+4. Folder for loading modules: this directory (all `.py` files)
+5. **Next**
 
 ## Configuration
 
-1. Open the **VeriHunt** tab in Burp Suite
-2. Go to **Settings**
-3. Select your **Active Provider** (Anthropic, OpenAI, OpenRouter, Gemini,
-   Ollama, DeepSeek, Kimi, Mistral, Groq, xAI, OpenCode Zen, Z.AI).
-   **Theme**: leave on *Auto* to follow Burp's Look and Feel, or force
-   *Light* / *Dark* if panels render with the wrong theme (applies immediately).
-4. Enter your API key in the provider's panel
-5. Select or type your model name
-6. Click **Save Settings**
+1. Open the **VeriHunt** tab → **Settings**
+2. Pick **Active Provider**, enter the API key, choose or type a model
+3. Theme: *Auto* follows Burp; *Light* / *Dark* force a palette
+4. **Save Settings**
 
 ## Usage
 
-1. Browse the target application (Proxy > HTTP history accumulates traffic)
-2. Right-click any request > **VeriHunt > Analyze with AI**
-3. The analysis runs in the background (the UI stays responsive)
-4. Switch to the **Results** tab to view findings
+1. Browse the target (Proxy → HTTP history)
+2. Right-click a request → **VeriHunt → Analyze with AI**
+3. Open the **Results** tab
 
-The Results tab shows a severity tally (`3 High / 2 Med / 3 Low / 21 Info`),
-the active AI model driving the analysis, and a per-finding advisory. The
-analyzed exchange appears in read-only **Analyzed Request** / **Analyzed
-Response** viewers (native Burp editors: right-click, Send to Repeater, and so
-on still work). A resizable **AI Chat** box (drag the divider) answers
-follow-up questions grounded on the selected request (for example: "test the
-`file` parameter for LFI"). The UI adapts to Burp's light or dark theme.
+Results show a severity tally, the active model, and per-finding advisory.
+Analyzed Request/Response use native Burp editors (Send to Repeater/Intruder
+still works). Drag the divider to resize AI Chat for follow-ups on the
+selected request.
 
-### Confirmed vs Potential findings
+### Confirmed vs Potential
 
-Analysis is passive: the extension never sends the payload itself. A finding
-whose evidence is present in the actual response (reflected value, error,
-missing header, disclosed data) is reported with its plain name and
-Certain/Firm confidence. A finding the AI can only infer from parameter names
-(for example LFI or SQLi from a `content` parameter) is marked **Tentative**
-and prefixed **"Potential"**, so an unverified High never reads like a proven
-one. Use the AI Chat to verify a Potential finding interactively.
+Analysis is passive: the extension does not send attack payloads. Evidence in
+the real response (reflection, error, missing header, leak) keeps the plain
+finding name with Certain/Firm confidence. Inferences from parameter names
+alone are **Tentative** and prefixed **Potential**. Use AI Chat or Repeater
+to verify Potentials.
 
-**Self-verification** (Settings > *Self-verify*, on by default) adds a second
-AI pass that re-judges every finding against the actual response: proven
-findings are kept, unproven ones are automatically downgraded to **Potential**,
-and refuted ones are dropped. This cuts false positives at the cost of one
-extra API call per analysis. The Results tab also has a severity filter and
-sorts findings High to Information.
+**Self-verify** re-checks each finding against the response (one extra API
+call). Results support a severity filter and High → Information sort.
+**Toggle False Positive** greys a row and removes it from the tally; **Hide
+FP** collapses those rows. JSON export includes `false_positive`,
+`total_active`, and `total_false_positive`.
 
-Mark a finding as a false positive with **Toggle False Positive** (it is
-greyed and kept out of the severity tally); tick **Hide FP** to collapse false
-positives out of the list entirely. **Export JSON** flags each record with
-`false_positive` and reports `total_active` / `total_false_positive`, so
-marked false positives stay distinguishable in the file.
+## Prompt customization
 
-## Prompt Customization
+Settings exposes an editable **User Prompt Template**. Placeholders:
 
-The **Settings** tab shows the editable **User Prompt Template**.
-
-Available placeholders:
-
-| Placeholder | Description |
+| Placeholder | Meaning |
 | --- | --- |
 | `{URL}` | Full target URL |
-| `{METHOD}` | HTTP method (GET, POST, etc.) |
-| `{REQUEST}` | Full raw HTTP request |
-| `{REQUEST_HEADERS}` | Request headers only |
-| `{REQUEST_BODY}` | Request body only |
-| `{RESPONSE}` | Full raw HTTP response |
-| `{RESPONSE_STATUS_LINE}` | Status line (HTTP/1.1 200 OK) |
-| `{RESPONSE_HEADERS}` | Response headers only |
-| `{RESPONSE_BODY}` | Response body (truncated if large) |
-| `{IS_TRUNCATED_PROMPT}` | True if content was truncated |
-| `{COLLABORATOR_URL}` | Burp Collaborator OOB payload URL |
+| `{METHOD}` | HTTP method |
+| `{REQUEST}` | Raw request |
+| `{REQUEST_HEADERS}` | Request headers |
+| `{REQUEST_BODY}` | Request body |
+| `{RESPONSE}` | Raw response |
+| `{RESPONSE_STATUS_LINE}` | Status line |
+| `{RESPONSE_HEADERS}` | Response headers |
+| `{RESPONSE_BODY}` | Body (truncated if large) |
+| `{IS_TRUNCATED_PROMPT}` | True when truncated |
+| `{COLLABORATOR_URL}` | Collaborator OOB URL |
 
-The **System Prompt** is built-in and not editable. It provides the security
-expert persona and analysis framework.
+The system prompt is built-in (not editable).
 
-## Advanced Prompting
+## Analysis coverage
 
-The system prompt and analysis template are built for the Agentic Web Pentest
-pipeline. Each request is evaluated across:
+Each request is scored across:
 
-- **Injection**: SQLi, NoSQLi, OS Command, SSTI, XXE, LDAP/XPath
-- **Auth/AuthZ**: Bypass, JWT (alg:none, key confusion, kid injection),
-  OAuth/OIDC, IDOR, BOLA, 2FA bypass
-- **Client-side**: Reflected/Stored/DOM XSS, CSRF, CORS misconfiguration,
-  Clickjacking
-- **Server-side**: SSRF, Path Traversal, File Upload bypass, HTTP Smuggling,
-  Cache Poisoning
-- **Deserialization**: Java (ysoserial), PHP, Python pickle, .NET ViewState,
-  JSON, prototype pollution
-- **JavaScript Analysis**: Hardcoded secrets, dangerous sinks, exposed
-  endpoints, source maps
-- **Sensitive File Exposure**: `.env`, `.git`, backup files, config leaks,
-  directory listing
-- **Business Logic**: Race conditions, price tampering, mass assignment,
-  flow bypass
-- **API Security**: REST, GraphQL, WebSocket, gRPC attack surfaces
-- **CVE Identification**: Maps detected technology versions to known CVEs
-  (Spring4Shell, Log4Shell, Ghostcat, Struts, etc.)
-- **OOB Detection**: Burp Collaborator payloads injected into SSRF, blind
-  SQLi, XXE and blind XSS PoCs
+- Injection (SQLi, NoSQLi, OS command, SSTI, XXE, LDAP/XPath)
+- Auth/AuthZ (bypass, JWT, OAuth/OIDC, IDOR, BOLA, 2FA)
+- Client-side (XSS, CSRF, CORS, clickjacking)
+- Server-side (SSRF, path traversal, upload bypass, smuggling, cache)
+- Deserialization (Java, PHP, pickle, ViewState, JSON, prototype pollution)
+- JavaScript (secrets, sinks, endpoints, source maps)
+- Sensitive files (`.env`, `.git`, backups, listings)
+- Business logic (races, price tampering, mass assignment, flow bypass)
+- API surfaces (REST, GraphQL, WebSocket, gRPC)
+- CVE mapping for detected tech versions
+- Collaborator OOB hints for SSRF, blind SQLi, XXE, blind XSS PoCs
 
 ## Requirements
 
 - Burp Suite Professional or Community (recent build)
 - Jython Standalone 2.7 (JAR)
-- An API key for at least one LLM provider (or a local Ollama server)
+- An API key for at least one LLM provider, or a local Ollama server
 
 ## Files
 
 ```
-verihunt.py          Main BurpExtender entry point (load this in Burp)
-api_client.py        Multi-provider LLM client (Anthropic, OpenAI, OpenRouter, Ollama, ...)
-prompt_handler.py    Prompt engineering and templates
-scanner.py           Background analysis orchestration
-hunt_engine.py       AI Hunt heuristics engine
-js_engine.py         JavaScript analysis engine
-memory.py            Cross-scan memory (per-host FP and confirmation store)
-report_generator.py  AI response parser, produces structured Burp issues
-demo_data.py         Demo/sample data helper
-ui.py                Full Swing UI with tabbed settings and results
-docs/screenshots/    Product screenshots
-README.md            This file
-CHANGELOG.md         Release notes
+verihunt.py           BurpExtender entry (load this)
+api_client.py         Multi-provider LLM client
+prompt_handler.py     Prompts and templates
+scanner.py            Background analysis
+hunt_engine.py        AI Hunt heuristics
+js_engine.py          JavaScript analysis
+memory.py             Per-host FP / confirmation store
+report_generator.py   Parse AI output → Burp issues
+demo_data.py          Demo helpers
+ui.py                 Swing UI
+docs/screenshots/     Product screenshots
+README.md
+CHANGELOG.md
 ```
 
-## OpenRouter Free Models (No API Key Cost)
+## OpenRouter free models
 
-OpenRouter offers several free models suitable for security analysis:
+Examples (no provider fee; subject to OpenRouter availability):
 
 - `meta-llama/llama-3.3-70b-instruct:free`
 - `google/gemini-2.0-flash-exp:free`
 - `mistralai/mistral-7b-instruct:free`
 
-Get a free key at https://openrouter.ai/keys
+Keys: https://openrouter.ai/keys
